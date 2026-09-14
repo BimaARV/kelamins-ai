@@ -1,0 +1,111 @@
+# KELA AI - Docker Compose (local / Docker host)
+# Host ports: API 2406, MariaDB 2407, Redis 2408.
+# Services communicate over the internal Docker network only (mariadb:3306 /
+# redis:6379). Never use localhost for inter-container traffic.
+
+services:
+  api:
+    build: .
+    container_name: kela-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    env_file:
+      - .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    ports:
+      - "2406:8000"
+    volumes:
+      - kela_documents:/app/storage/documents
+      - kela_reports:/app/storage/reports
+      - kela_images:/app/storage/images
+    restart: unless-stopped
+
+  worker:
+    build: .
+    container_name: kela-worker
+    command: python -m app.workers
+    env_file:
+      - .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    volumes:
+      - kela_documents:/app/storage/documents
+      - kela_reports:/app/storage/reports
+      - kela_images:/app/storage/images
+    restart: unless-stopped
+
+  scheduler:
+    build: .
+    container_name: kela-scheduler
+    command: python -m app.scheduler
+    env_file:
+      - .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    volumes:
+      - kela_documents:/app/storage/documents
+      - kela_reports:/app/storage/reports
+      - kela_images:/app/storage/images
+    restart: unless-stopped
+
+  bot:
+    build: .
+    container_name: kela-bot
+    command: python -m app.interfaces.telegram
+    env_file:
+      - .env
+    environment:
+      # Bot runs on the HOST network so /ping, /traceroute, /ipinfo see the
+      # real host network (wlan0). Reach DB/Redis via published host ports.
+      DATABASE_URL: mysql+asyncmy://${MARIADB_USER}:${MARIADB_PASSWORD}@127.0.0.1:2407/${MARIADB_DATABASE}
+      REDIS_URL: redis://127.0.0.1:2408/0
+    network_mode: host
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    volumes:
+      - /:/host-root:ro
+      - kela_documents:/app/storage/documents
+      - kela_reports:/app/storage/reports
+      - kela_images:/app/storage/images
+    restart: unless-stopped
+
+  mariadb:
+    image: mariadb:12
+    container_name: kela-mariadb
+    environment:
+      MARIADB_DATABASE: ${MARIADB_DATABASE}
+      MARIADB_USER: ${MARIADB_USER}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+    ports:
+      - "2407:3306"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: kela-redis
+    ports:
+      - "2408:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  mariadb_data:
+  kela_documents:
+  kela_reports:
+  kela_images:

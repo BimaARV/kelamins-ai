@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Env & secrets
+.env
+.env.local
+*.secret
+
+# Storage artifacts
+/storage/documents/*
+/storage/reports/*
+/storage/images/*
+/storage/exports/*
+/storage/temp/*
+!/storage/**/.gitkeep
+
+# Local dev
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+*.log
