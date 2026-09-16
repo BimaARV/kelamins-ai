@@ -355,7 +355,7 @@ async def _asn(session: AsyncSession, arg: str) -> str:  # noqa: ARG001
         return format_asn(ip, info)
     # Accept AS number: "140444", "AS140444", "as 140444"
     raw = (arg or "").strip()
-    m = _re.match(r"^AS?(\d{1,10})$", raw, _re.IGNORECASE)
+    m = _re.match(r"^(?:AS)?\s*(\d{1,10})$", raw, _re.IGNORECASE)
     if m:
         from app.netinfo import asn_number_lookup, format_asn_number
 
@@ -632,6 +632,8 @@ async def _cron_cancel(session: AsyncSession, arg: str) -> str:  # noqa: ARG001
 # ---------------------------------------------------------------------------
 
 async def _monitor(session: AsyncSession, arg: str, chat_id: str | None = None) -> str:
+    from app.monitoring import resolve_monitor_number
+
     parts = (arg or "").strip().split(None, 1)
     if not parts:
         return await monitoring_list(session)
@@ -639,9 +641,18 @@ async def _monitor(session: AsyncSession, arg: str, chat_id: str | None = None) 
         return await monitoring_list(session)
     if parts[0].lower() in ("stop", "off", "hapus", "berhenti", "batalkan", "cancel", "matiin"):
         target = parts[1].strip() if len(parts) > 1 else ""
+        # Support "/monitor stop <nomor>" — resolve list index → target first
+        if target.isdigit() and (resolved := await resolve_monitor_number(session, target)):
+            target = resolved
         return await stop_monitoring(session, target)
     if parts[0].lower() in ("edit", "ubah", "ganti"):
         rest = parts[1].strip() if len(parts) > 1 else ""
+        # Support "/monitor edit <nomor> ..." — resolve leading list index → target
+        rest_parts = rest.split(None, 1)
+        if rest_parts and rest_parts[0].isdigit() and (
+            resolved := await resolve_monitor_number(session, rest_parts[0])
+        ):
+            rest = resolved + (f" {rest_parts[1]}" if len(rest_parts) > 1 else "")
         return await edit_monitor(session, rest)
     return await start_monitoring(session, arg, chat_id=chat_id)
 
@@ -834,7 +845,9 @@ async def monitoring_list(session: AsyncSession) -> str:
         latency = f" · {c.latency_ms:.0f} ms" if c and c.latency_ms is not None else ""
         name = t.name if t.name and t.name != t.target else t.target
         lines.append(f"\n• {bold(esc(name))} — {mono(st)}{latency}")
-        lines.append(f"  #{idx} · interval {t.interval_seconds}s · stop: /monitor stop {esc(t.target)}")
+        lines.append(
+            f"  #{idx} · interval {t.interval_seconds}s · stop: /monitor stop {idx} · edit: /monitor edit {idx} nama …"
+        )
     return "\n".join(lines)
 
 

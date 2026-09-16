@@ -291,6 +291,32 @@ async def set_monitor_name(session, target: str, name: str) -> NetworkTarget | N
     return row
 
 
+async def resolve_monitor_number(session, number_str: str) -> str | None:
+    """Resolve a 1-based list index to the target's IP/domain string.
+
+    The ordering matches ``monitoring_list`` (``NetworkTarget.id ASC``).
+    Returns ``None`` when the index is out of range or not a valid number.
+    """
+    if not number_str or not number_str.isdigit():
+        return None
+    idx = int(number_str)
+    if idx < 1:
+        return None
+    ids = await list_monitored_ids()
+    if not ids or idx > len(ids):
+        return None
+    # ids are ordered by id ASC (from list_monitored_ids → Redis SET)
+    target_id = ids[idx - 1]
+    from sqlalchemy import select as _select
+
+    row = (
+        await session.execute(
+            _select(NetworkTarget.target).where(NetworkTarget.id == target_id)
+        )
+    ).scalar_one_or_none()
+    return row
+
+
 # ---------------------------------------------------------------------------
 # Monitor command parsing: target + optional label ("nama ...")
 # ---------------------------------------------------------------------------
