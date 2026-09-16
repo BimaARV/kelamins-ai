@@ -148,3 +148,87 @@ def format_asn(ip: str, info: dict) -> str:
         lines.append(f"  {label}: {mono(esc(str(value)))}")
     lines.append("\nsumber: ipwho.is")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# RDAP autnum lookup (for /asn <AS_NUMBER>, e.g. /asn 140444)
+# ---------------------------------------------------------------------------
+
+_RDAP_AUTNUM_SOURCES = [
+    "https://rdap.org/autnum/{}",
+    "https://rdap.apnic.net/autnum/{}",
+    "https://rdap.arin.net/registry/autnum/{}",
+    "https://rdap.ripe.net/autnum/{}",
+]
+
+
+def _parse_autnum_rdap(item: dict) -> dict | None:
+    """Extract relevant fields from a RDAP autnum response."""
+    handle = item.get("handle") or ""
+    name = item.get("name") or ""
+    if not handle and not name:
+        return None
+    status = (item.get("status") or [""])[0] if isinstance(item.get("status"), list) else str(item.get("status") or "")
+    country = item.get("country") or ""
+    # Walk entities for registrant org (role "registrant" fn), or technical contact
+    org = name  # fallback: AS name itself
+    abuse_contact = ""
+    for ent in item.get("entities", []):
+        roles = ent.get("roles", [])
+        vc = (ent.get("vcardArray") or [None, []])[1]
+        fn_parts = [x[3] for x in (vc or []) if x[0] == "fn"]
+        fn = (fn_parts[0] if fn_parts else "").strip()
+        if "registrant" in roles and fn:
+            org = fn
+        elif "abuse" in roles and fn:
+            abuse_contact = fn
+    return {
+        "asn_handle": handle,
+        "asn_name": name,
+        "org": org,
+        "country": country,
+        "status": status,
+        "abuse_contact": abuse_contact,
+    }
+
+
+async def asn_number_lookup(asn: int) -> dict | None:
+    """Look up an AS number via RDAP (bootstrap → RIRs).
+
+    Returns a normalised dict or None on failure.
+    """
+    import httpx as _httpx
+
+    for src in _RDAP_AUTNUM_SOURCES:
+        url = src.format(asn)
+        try:
+            async with _httpx.AsyncClient(
+                timeout=12.0, follow_redirects=True, headers={"User-Agent": BROWSER_UA}
+            ) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        info = _parse_autnum_rdap(data)
+                        if info:
+                            return info
+        except (_httpx.HTTPError, ValueError):
+            continue
+    return None
+
+
+def format_asn_number(asn: int, info: dict) -> str:
+    lines = [bold(f"ASN — {mono(f'AS{asn}')}")]
+    rows = [
+        ("Name", info.get("asn_name") or "?"),
+        ("Handle", info.get("asn_handle") or "?"),
+        ("Org", info.get("org") or "?"),
+        ("Negara", info.get("country") or "?"),
+        ("Status", info.get("status") or "?"),
+    ]
+    if info.get("abuse_contact"):
+        rows.append(("Abuse", info["abuse_contact"]))
+    for label, value in rows:
+        lines.append(f"  {label}: {mono(esc(str(value)))}")
+    lines.append("\nsumber: RDAP")
+    return "\n".join(lines)

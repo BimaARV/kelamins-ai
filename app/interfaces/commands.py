@@ -73,13 +73,14 @@ HELP = (
     f"  /documents  {esc('Daftar dokumen')}\n"
     f"  /crons      {esc('Daftar cron/reminder aktif')}\n"
     f"  /cron cancel {esc('<id> — batalin cron (contoh: /cron cancel a1b2c3)')}\n"
+   f"  /cron edit {esc('<id> <jadwal/pesan> — edit cron (contoh: /cron edit a1b2c3 besok jam 7 pagi)')}\n"
     f"\n"
     f"Ketik pesan biasa untuk chat natural language (perlu AI key aktif).\n"
     f"Contoh cron: 'ingetin pulang jam 17.00', 'cron besok jam 7 pagi ingetin meeting'."
 )
 
 
-async def dispatch(text: str, session: AsyncSession) -> str:
+async def dispatch(text: str, session: AsyncSession, *, chat_id: str | None = None) -> str:
     """Route ``/command [args]`` and return HTML reply."""
     parts = text.strip().split(None, 1)
     if not parts:
@@ -122,6 +123,8 @@ async def dispatch(text: str, session: AsyncSession) -> str:
             f"Ketik {mono('/help')} untuk daftar perintah."
         )
     try:
+        if handler is _monitor:
+            return await handler(session, arg, chat_id=chat_id)
         return await handler(session, arg)
     except Exception as exc:
         return f"{bold('Error')} — {esc(str(exc)[:300])}"
@@ -206,14 +209,21 @@ async def _render_news(
     keywords: list[str] | None = None,
     content: list[str] | None = None,
     limit: int = 8,
+    max_age_hours: int = 0,
 ) -> str:
+    from app.config import settings
+
+    max_age_hours = max_age_hours or settings.news_max_age_hours
     stmt = (
         select(Article, Source.name.label("source_name"))
         .join(Source, Article.source_id == Source.id, isouter=True)
-        .order_by(desc(Article.scraped_at))
+        .order_by(func.coalesce(Article.published_at, Article.scraped_at).desc())
         .limit(limit)
     )
     filters: list = []
+    if max_age_hours > 0:
+        cutoff = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None) - _dt.timedelta(hours=max_age_hours)
+        filters.append(or_(Article.published_at.is_(None), Article.published_at >= cutoff))
     if tech_only and keywords:
         filters.append(
             or_(
@@ -234,7 +244,7 @@ async def _render_news(
     lines = [bold(esc(title))]
     for art, src_name in rows:
         title_text = esc(art.title or "(tanpa judul)")
-        when = dt(art.scraped_at)
+        when = dt(art.published_at or art.scraped_at)
         lines.append(f"\n• <a href=\"{esc(art.url)}\">{title_text}</a>")
         lines.append(f"  {esc(src_name or '?')} — {when}")
     return "\n".join(lines)
@@ -335,16 +345,29 @@ async def _weather(session: AsyncSession, arg: str) -> str:
 
 
 async def _asn(session: AsyncSession, arg: str) -> str:  # noqa: ARG001
+    import re as _re
+
     ip = extract_ip(arg)
-    if not ip:
-        return (
-            f"{bold('ASN')} — kasih IP publik dong.\n"
-            f"Contoh: {mono('/asn 8.8.8.8')}"
-        )
-    info = await asn_lookup(ip)
-    if info is None:
-        return f"{bold('ASN')} — {mono(esc(ip))} gagal di-resolve."
-    return format_asn(ip, info)
+    if ip:
+        info = await asn_lookup(ip)
+        if info is None:
+            return f"{bold('ASN')} — {mono(esc(ip))} gagal di-resolve."
+        return format_asn(ip, info)
+    # Accept AS number: "140444", "AS140444", "as 140444"
+    raw = (arg or "").strip()
+    m = _re.match(r"^AS?(\d{1,10})$", raw, _re.IGNORECASE)
+    if m:
+        from app.netinfo import asn_number_lookup, format_asn_number
+
+        asn_num = int(m.group(1))
+        info = await asn_number_lookup(asn_num)
+        if info is None:
+            return f"{bold('ASN')} — {mono(f'AS{asn_num}')} gagal di-resolve via RDAP."
+        return format_asn_number(asn_num, info)
+    return (
+        f"{bold('ASN')} — kasih IP publik atau AS number dong.\n"
+        f"Contoh: {mono('/asn 8.8.8.8')} atau {mono('/asn 140444')}"
+    )
 
 
 async def _geo_trace(session: AsyncSession, arg: str) -> str:  # noqa: ARG001
@@ -579,22 +602,36 @@ async def _crons(session: AsyncSession, arg: str) -> str:  # noqa: ARG001
 
 
 async def _cron_cancel(session: AsyncSession, arg: str) -> str:  # noqa: ARG001
-    from app.cron import delete_job, format_jobs_list, list_jobs
+    from app.cron import delete_job, edit_job, format_ack, format_jobs_list, list_jobs
 
-    parts = (arg or "").split()
-    if len(parts) == 2 and parts[0].lower() == "cancel":
-        job_id = parts[1]
-        if await delete_job(job_id):
-            return f"{bold('Cron dihapus')} — {mono(esc(job_id))}.\n\n" + format_jobs_list(await list_jobs())
-        return f"{bold('?')} Cron {mono(esc(job_id))} nggak ketemu."
-    return format_jobs_list(await list_jobs()) + f"\n\nBatal: {mono('/cron cancel <id>')}"
+    parts = (arg or "").split(maxsplit=2)
+    if len(parts) >= 2:
+        verb, job_id = parts[0].lower(), parts[1]
+        if verb == "cancel":
+            if await delete_job(job_id):
+                return f"{bold('Cron dihapus')} — {mono(esc(job_id))}.\n\n" + format_jobs_list(await list_jobs())
+            return f"{bold('?')} Cron {mono(esc(job_id))} nggak ketemu."
+        if verb == "edit":
+            payload = parts[2] if len(parts) > 2 else ""
+            status, job, hint = await edit_job(job_id, payload, "cli")
+            if status == "ok":
+                return format_ack(job)
+            if status == "missing":
+                return f"{bold('?')} Cron {mono(esc(job_id))} nggak ketemu."
+            if status == "redis_unavailable":
+                return "Redis lagi ngadat, edit cron nggak kesimpen. Coba lagi."
+            return hint or f"{bold('Cron edit')} — gak bisa diubah."
+    return format_jobs_list(await list_jobs()) + (
+        f"\n\nBatal: {mono('/cron cancel <id>')}"
+        f"\nEdit: {mono('/cron edit <id> <jadwal/pesan>')}"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Chat-driven network monitoring (also used by telegram free-text intercept)
 # ---------------------------------------------------------------------------
 
-async def _monitor(session: AsyncSession, arg: str) -> str:
+async def _monitor(session: AsyncSession, arg: str, chat_id: str | None = None) -> str:
     parts = (arg or "").strip().split(None, 1)
     if not parts:
         return await monitoring_list(session)
@@ -603,27 +640,37 @@ async def _monitor(session: AsyncSession, arg: str) -> str:
     if parts[0].lower() in ("stop", "off", "hapus", "berhenti", "batalkan", "cancel", "matiin"):
         target = parts[1].strip() if len(parts) > 1 else ""
         return await stop_monitoring(session, target)
-    return await start_monitoring(session, parts[0].strip())
+    if parts[0].lower() in ("edit", "ubah", "ganti"):
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        return await edit_monitor(session, rest)
+    return await start_monitoring(session, arg, chat_id=chat_id)
 
 
-async def start_monitoring(session: AsyncSession, target_str: str) -> str:
+async def start_monitoring(session: AsyncSession, text: str, chat_id: str | None = None) -> str:
     from app.collectors.network.checks import run_check
     from app.db.repo import store_network_check
     from app.memory import remember
     from app.monitoring import (
         is_monitor_target,
+        parse_monitor_command,
+        set_monitor_name_pending,
         set_monitored,
         set_monitor_status,
         upsert_monitor_target,
     )
 
-    target_str = (target_str or "").strip().lower()
-    if not is_monitor_target(target_str):
+    target, label = parse_monitor_command(text or "")
+    if not target or not is_monitor_target(target):
         return (
             f"{bold('Monitor')} — target gak valid.\n"
-            f"Kirim IP non-loopback atau domain. Contoh: {mono('/monitor 8.8.8.8')}"
+            f"Kirim IP non-loopback atau domain. Contoh: {mono('/monitor 8.8.8.8')}\n"
+            f"Nama opsional: {mono('/monitor 114.120.14.5 nama ROUTER RUMAH')}"
         )
-    row, _created = await upsert_monitor_target(session, target_str)
+    row, _created = await upsert_monitor_target(session, target)
+    if label:
+        row.name = label
+        await session.commit()
+        await session.refresh(row)
     await set_monitored(row.id)
     result = await run_check(row)
     await store_network_check(session, row.id, result)
@@ -632,17 +679,27 @@ async def start_monitoring(session: AsyncSession, target_str: str) -> str:
     await set_monitor_status(row.id, status)
     await remember(
         session,
-        f"monitor {target_str} (status {status})",
+        f"monitor {target} (status {status})" + (f" nama {label}" if label else ""),
         kind="monitor",
         source="chat",
         meta={"target_id": row.id},
     )
+    display = label or target
     lines = [
-        f"{bold('Monitor aktif')} — {bold(esc(target_str))} dicek tiap {mono('60')} detik.",
+        f"{bold('Monitor aktif')} — {bold(esc(display))} {mono(f'({esc(target)})')} dicek tiap {mono('60')} detik.",
         "Alert DOWN/PULIH bakal dikirim otomatis.",
         "",
         f"Cek pertama: {_monitor_check_line(result)}",
     ]
+    if not label and chat_id:
+        await set_monitor_name_pending(chat_id, target)
+        lines.extend(
+            [
+                "",
+                f"{bold('Mau dikasih nama buat monitoring ini?')} (opsional)",
+                f"Balas: {mono('Ya, nama RO UNIV')}, {mono('Ngga usah')}, atau langsung ketik namanya.",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -655,6 +712,68 @@ def _monitor_check_line(result: dict) -> str:
     if result.get("error_message"):
         parts.append(esc(str(result["error_message"])[:140]))
     return " · ".join(parts)
+
+
+def _parse_monitor_edits(params: str) -> dict:
+    import re as _re
+
+    edits: dict = {}
+    params = (params or "").strip()
+    if not params:
+        return edits
+    nm = _re.search(r"\bnama\s*[:=]?\s*(.+?)(?:\s+(?:interval|timeout)\b|$)", params, _re.I)
+    if nm:
+        edits["name"] = nm.group(1).strip().rstrip(".")
+    iv = _re.search(r"\binterval\s*[:=]?\s*(\d+)", params, _re.I)
+    if iv:
+        edits["interval"] = int(iv.group(1))
+    tt = _re.search(r"\btimeout\s*[:=]?\s*(\d+)", params, _re.I)
+    if tt:
+        edits["timeout"] = int(tt.group(1))
+    return edits
+
+
+async def edit_monitor_target(session: AsyncSession, target: str, edits: dict) -> str:
+    from app.monitoring import update_monitor_target
+
+    row, detail = await update_monitor_target(
+        session,
+        target,
+        name=edits.get("name"),
+        interval=edits.get("interval"),
+        timeout=edits.get("timeout"),
+    )
+    if row is None:
+        return f"{bold('Monitor edit')} — {detail}"
+    return (
+        f"{bold('Monitor diubah')} — {bold(esc(target))}\n"
+        f"  {detail}\n"
+        f"  stop: {mono(f'/monitor stop {esc(target)}')}"
+    )
+
+
+async def edit_monitor(session: AsyncSession, text: str) -> str:
+    from app.monitoring import is_monitor_target
+
+    text = (text or "").strip()
+    parts = text.split(None, 1)
+    if not parts:
+        return (
+            f"{bold('Monitor edit')} — pakai:\n"
+            f"{mono('/monitor edit <target> nama <label>')} "
+            f"{mono('[interval <detik>] [timeout <detik>]')}"
+        )
+    target = parts[0].lower()
+    if not is_monitor_target(target):
+        return f"{bold('Monitor edit')} — {mono(esc(target))} bukan IP/domain yang valid."
+    edits = _parse_monitor_edits(parts[1] if len(parts) > 1 else "")
+    if not edits:
+        return (
+            f"{bold('Monitor edit')} — gak ada param yang bisa diubah.\n"
+            f"Pakai {mono('nama / interval / timeout')}. Contoh: "
+            f"{mono('/monitor edit 8.8.8.8 nama DNS GOOGLE interval 120')}"
+        )
+    return await edit_monitor_target(session, target, edits)
 
 
 async def stop_monitoring(session: AsyncSession, target_str: str) -> str:
@@ -709,12 +828,13 @@ async def monitoring_list(session: AsyncSession) -> str:
         )
     ).scalars().all()
     lines = [bold("Monitor aktif")]
-    for t in targets:
+    for idx, t in enumerate(targets, 1):
         c = by_tid.get(t.id)
         st = getattr(c.status, "value", c.status) if c else "belum dicek"
         latency = f" · {c.latency_ms:.0f} ms" if c and c.latency_ms is not None else ""
-        lines.append(f"\n• {bold(esc(t.name))} — {mono(st)}{latency}")
-        lines.append(f"  #{t.id} · interval {t.interval_seconds}s · stop: /monitor stop {esc(t.name)}")
+        name = t.name if t.name and t.name != t.target else t.target
+        lines.append(f"\n• {bold(esc(name))} — {mono(st)}{latency}")
+        lines.append(f"  #{idx} · interval {t.interval_seconds}s · stop: /monitor stop {esc(t.target)}")
     return "\n".join(lines)
 
 

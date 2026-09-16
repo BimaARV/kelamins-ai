@@ -170,7 +170,7 @@ async def _dispatch_text(text: str, chat_id: str, message_id: int) -> None:
 
     if text.startswith("/"):
         async with session_factory() as session:
-            reply = await dispatch(text, session)
+            reply = await dispatch(text, session, chat_id=chat_id)
         markup = (
             main_keyboard()
             if text.lower().strip() in ("/start", "/help")
@@ -183,10 +183,90 @@ async def _dispatch_text(text: str, chat_id: str, message_id: int) -> None:
 
 
 async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
-    """Route free-text in order: shell → monitor → memory → scrape → whois → cron → AI."""
+    """Route free-text in order: pending-name → monitor-edit → shell → hostcmd → monitor → memory → scrape → whois → cron → sysinfo → AI."""
+    from app.monitoring import (
+        clear_monitor_name_pending,
+        detect_monitor_edit,
+        get_monitor_name_pending,
+        resolve_monitor_name_prompt,
+        set_monitor_name,
+    )
+
+    pending_target = await get_monitor_name_pending(chat_id)
+    if pending_target:
+        decision = resolve_monitor_name_prompt(text)
+        if decision == "decline":
+            await clear_monitor_name_pending(chat_id)
+            await send_message(
+                chat_id,
+                "Oke, gapapa — namanya tetep target aja.",
+                reply_to=message_id,
+            )
+            return
+        if decision == "yes":
+            await send_message(
+                chat_id,
+                "Oke — mau dikasih nama apa buat monitoring ini? (ketik langsung namanya aja)",
+                reply_to=message_id,
+            )
+            return
+        if decision.startswith("name:"):
+            label = decision[5:]
+            from app.db.session import session_factory
+
+            async with session_factory() as session:
+                row = await set_monitor_name(session, pending_target, label)
+            await clear_monitor_name_pending(chat_id)
+            if row is None:
+                reply = f"{bold('Monitor')} — {mono(esc(pending_target))} gak ketemu lagi."
+            else:
+                reply = (
+                    f"{bold('Oke, nama ke-set')} — {bold(esc(label))} "
+                    f"buat {mono(esc(pending_target))}."
+                )
+            await send_message(chat_id, reply, reply_to=message_id)
+            return
+        # unrelated text → clear the stale prompt and keep routing normally
+        await clear_monitor_name_pending(chat_id)
+
+    edit = detect_monitor_edit(text)
+    if edit is not None:
+        from app.db.session import session_factory
+        from app.interfaces.commands import edit_monitor_target
+
+        async with session_factory() as session:
+            reply = await edit_monitor_target(session, edit[0], edit[1])
+        await send_message(chat_id, reply, reply_to=message_id)
+        return
+
     shell_args = parse_server_request(text)
     if shell_args is not None:
         await _handle_server_cmd(shell_args, chat_id, message_id)
+        return
+
+    from app.hostcmd import (
+        detect_hostcmd_request,
+        host_list_dir,
+        host_read_file,
+        host_write_file,
+        render_hostcmd_result,
+        run_host_command,
+    )
+
+    hc_req = detect_hostcmd_request(text)
+    if hc_req is not None:
+        kind = hc_req.get("kind")
+        if kind == "read":
+            raw = host_read_file(hc_req["path"])
+        elif kind == "write":
+            raw = host_write_file(hc_req["path"], hc_req.get("content", ""))
+        elif kind == "dir":
+            raw = host_list_dir(hc_req["path"])
+        elif kind == "cmd":
+            raw = run_host_command(hc_req["content"])
+        else:
+            raw = "Unknown host request."
+        await send_message(chat_id, render_hostcmd_result(hc_req, raw), reply_to=message_id)
         return
 
     stop_target = detect_monitor_stop(text)
@@ -199,7 +279,7 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
             if stop_target is not None:
                 reply = await stop_monitoring(session, stop_target)
             else:
-                reply = await start_monitoring(session, mon_target or "")
+                reply = await start_monitoring(session, text, chat_id=chat_id)
         await send_message(chat_id, reply, reply_to=message_id)
         return
 
@@ -221,8 +301,24 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
     if await _handle_cron_request(text, chat_id, message_id):
         return
 
+    from app.hoststats import detect_sysinfo_request
+
+    if detect_sysinfo_request(text):
+        from app.db.session import session_factory
+        from app.interfaces.commands import dispatch as _dispatch
+
+        async with session_factory() as session:
+            reply = await _dispatch("/sysinfo", session)
+        await send_message(chat_id, reply, reply_to=message_id)
+        return
+
     from app.db.session import session_factory
-    from app.interfaces.context import build_situation_block, get_history, push_history
+    from app.interfaces.context import (
+        build_news_briefing,
+        build_situation_block,
+        get_history,
+        push_history,
+    )
     from app.kela_ai.gateway import AIUnavailable, build_gateway
     from sqlalchemy import func, select
     from app.db.models import Article, Event, Earthquake, Alert
@@ -237,6 +333,7 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
         ]:
             counts[label] = (await session.execute(select(func.count(model.id)))).scalar() or 0
         situation = await build_situation_block(session)
+        briefing = await build_news_briefing(session)
 
     gw = build_gateway(settings)
     if not gw.configured:
@@ -271,6 +368,11 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
     )
     if situation:
         system += f"\n\nKONDISI SEKARANG (pakai fakta ini, jangan ngarang):\n{situation}"
+    if briefing:
+        system += (
+            f"\n\nARTIKEL DARI MONITORING (72 jam terakhir — sumber buat klaim berita, "
+            f"sebut nama feed-nya):\n{briefing}"
+        )
     history = await get_history(chat_id)
     messages = [
         {"role": "system", "content": system},
@@ -464,12 +566,33 @@ async def _handle_cron_request(text: str, chat_id: str, message_id: int) -> bool
     from app.cron import (
         add_job,
         build_cron_from_text,
+        cron_edit_request,
         cron_manage_request,
         delete_job,
+        edit_job,
         format_ack,
         format_jobs_list,
         list_jobs,
     )
+
+    edit_action, edit_id, edit_payload = cron_edit_request(text)
+    if edit_action == "edit":
+        status, job, hint = await edit_job(edit_id, edit_payload, chat_id)
+        if status == "missing":
+            await send_message(
+                chat_id, f"{bold('?')} Cron {mono(esc(edit_id))} nggak ketemu.", reply_to=message_id
+            )
+        elif status == "ok":
+            await send_message(chat_id, format_ack(job), reply_to=message_id)  # type: ignore[arg-type]
+        elif status == "redis_unavailable":
+            await send_message(
+                chat_id, "Redis lagi ngadat, edit cron nggak kesimpen. Coba lagi.", reply_to=message_id
+            )
+        else:
+            await send_message(
+                chat_id, hint or f"{bold('Cron edit')} — gak bisa diubah.", reply_to=message_id
+            )
+        return True
 
     action, job_id = cron_manage_request(text)
     if action == "list":

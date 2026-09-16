@@ -246,6 +246,213 @@ async def disable_monitor_target(session, target: NetworkTarget) -> None:
     await session.commit()
 
 
+async def update_monitor_target(
+    session,
+    target: str,
+    name: str | None = None,
+    interval: int | None = None,
+    timeout: int | None = None,
+) -> tuple[NetworkTarget | None, str]:
+    """Update name/interval/timeout of an active monitor target.
+
+    Returns (row, detail). row is None when target not found/disabled or a
+    range check fails. Validates: interval 10–3600, timeout 1–60.
+    """
+    row = await get_target_by_string(session, target)
+    if row is None or not row.enabled:
+        return None, "Target tidak aktif atau tidak ditemukan."
+    changed = []
+    if name is not None:
+        row.name = name.strip() or row.name
+        changed.append(f"nama → {row.name}")
+    if interval is not None:
+        if not 10 <= int(interval) <= 3600:
+            return None, "Interval harus 10–3600 detik."
+        row.interval_seconds = int(interval)
+        changed.append(f"interval → {row.interval_seconds}s")
+    if timeout is not None:
+        if not 1 <= int(timeout) <= 60:
+            return None, "Timeout harus 1–60 detik."
+        row.timeout_seconds = int(timeout)
+        changed.append(f"timeout → {row.timeout_seconds}s")
+    if not changed:
+        return row, "Tidak ada perubahan yang diminta."
+    await session.commit()
+    return row, ", ".join(changed)
+
+
+async def set_monitor_name(session, target: str, name: str) -> NetworkTarget | None:
+    """Give a friendly name to an active monitor target."""
+    row = await get_target_by_string(session, target)
+    if row is None or not row.enabled:
+        return None
+    row.name = name.strip() or row.name
+    await session.commit()
+    return row
+
+
+# ---------------------------------------------------------------------------
+# Monitor command parsing: target + optional label ("nama ...")
+# ---------------------------------------------------------------------------
+
+import re as _re  # noqa: E402
+
+_LABEL_RE = _re.compile(
+    r"\b(?:nama|label|name|named?)\s*[:=]?\s*(.+?)$",
+    _re.IGNORECASE,
+)
+
+
+def parse_monitor_command(text: str) -> tuple[str, str | None]:
+    """Parse ``/monitor <target> [nama <label>]`` → (target, label | None)."""
+    if not text:
+        return "", None
+    text = text.strip()
+    target = _extract_target(text) or ""
+    if not target:
+        return "", None
+    rest = text
+    ti = text.lower().find(target.lower())
+    if ti >= 0:
+        rest = text[ti + len(target):]
+    label = None
+    m = _LABEL_RE.search(rest)
+    if m:
+        cand = m.group(1).strip().rstrip(".")
+        if len(cand) >= 2:
+            label = cand
+    return target, label
+
+
+# ---------------------------------------------------------------------------
+# Monitor edit detection (free-text, before start/stop)
+# ---------------------------------------------------------------------------
+
+_EDIT_RE = _re.compile(
+    r"\b(?:ubah|ganti|edit|update|reschedule)\s+monitor\w*\s+"
+    r"(.+?)\s+(?:jadi|ke|to|:)\s+(.+)",
+    _re.IGNORECASE,
+)
+
+
+def detect_monitor_edit(text: str) -> tuple[str, dict] | None:
+    """Detect ``ubah monitor <target> jadi nama X interval 60``.
+
+    Returns ``(target, {name, interval, timeout})`` or None.
+    """
+    m = _EDIT_RE.search(text or "")
+    if not m:
+        return None
+    target = _extract_target(m.group(1) or "")
+    if not target:
+        return None
+    params = m.group(2) or ""
+    edits: dict = {}
+    nm = _re.search(r"\bnama\s*[:=]?\s*(.+?)(?:\s+(?:interval|timeout)\b|$)", params, _re.I)
+    if nm:
+        edits["name"] = nm.group(1).strip().rstrip(".")
+    iv = _re.search(r"\binterval\s*[:=]?\s*(\d+)", params, _re.I)
+    if iv:
+        edits["interval"] = int(iv.group(1))
+    tt = _re.search(r"\btimeout\s*[:=]?\s*(\d+)", params, _re.I)
+    if tt:
+        edits["timeout"] = int(tt.group(1))
+    if not edits:
+        return None
+    return target, edits
+
+
+# ---------------------------------------------------------------------------
+# Pending-name helpers (Redis / fallback memory)
+# ---------------------------------------------------------------------------
+
+import json as _json  # noqa: E402
+
+_MONITOR_PENDING_KEY = "bot:monitor:pending_name:{chat_id}"
+_PENDING_FALLBACK: dict[str, dict | None] = {}
+
+
+def _pending_ttl() -> int:
+    try:
+        from app.config import settings
+
+        return int(settings.monitor_name_prompt_ttl_seconds or 900)
+    except Exception:  # noqa: BLE001
+        return 900
+
+
+async def set_monitor_name_pending(chat_id: str, target_str: str) -> None:
+    data = _json.dumps({"target": target_str})
+    try:
+        client = _redis()
+        if client is not None:
+            await client.set(_MONITOR_PENDING_KEY.format(chat_id=chat_id), data, ex=_pending_ttl())
+            return
+    except Exception:  # noqa: BLE001
+        logger.warning("monitor pending: redis unavailable (write)", exc_info=True)
+    _PENDING_FALLBACK[chat_id] = {"target": target_str}
+
+
+async def get_monitor_name_pending(chat_id: str) -> str | None:
+    try:
+        client = _redis()
+        if client is not None:
+            raw = await client.get(_MONITOR_PENDING_KEY.format(chat_id=chat_id))
+            if raw:
+                data = _json.loads(raw)
+                return data.get("target")
+    except Exception:  # noqa: BLE001
+        logger.warning("monitor pending: redis unavailable (read)", exc_info=True)
+    data = _PENDING_FALLBACK.get(chat_id)
+    return data.get("target") if data else None
+
+
+async def clear_monitor_name_pending(chat_id: str) -> None:
+    try:
+        client = _redis()
+        if client is not None:
+            await client.delete(_MONITOR_PENDING_KEY.format(chat_id=chat_id))
+    except Exception:  # noqa: BLE001
+        pass
+    _PENDING_FALLBACK.pop(chat_id, None)
+
+
+def resolve_monitor_name_prompt(text: str) -> str:
+    """Classify the user reply to the pending-name prompt.
+
+    Returns one of:
+      - ``"none"``     → unrelated text; drop the pending prompt, route normally
+      - ``"decline"``  → user does not want a name
+      - ``"yes"``      → user agreed but no name given yet (re-prompt for it)
+      - ``"name:<l>"`` → user supplied a name to apply
+    """
+    t = (text or "").strip()
+    low = t.lower()
+    if not t or t.startswith("/"):
+        return "none"
+    # Decline: "nggak / ngga usah / gak / gausah / tidak / no ..."
+    clean = _re.sub(r"[^a-z]", "", low)
+    if clean in {
+        "nggak", "ngga", "enggak", "gak", "gk", "tidak", "no", "nope", "ga",
+        "gausah", "gakusah", "nggakusah", "nggausah", "enggakusah",
+        "nggakperlu", "nggaperlu", "skip",
+    }:
+        return "decline"
+    m = _re.match(r"^(?:ya|yap|yaps|iya|iyaa|ok|oke|sip)\b[\s:,.!-]*(?:nama\b\s*)?(.*)$", t, _re.I)
+    if m:
+        label = m.group(1).strip().strip(".,! -")
+        if not label or len(label) <= 3 or label.lower() in {"dong", "donk", "doh", "deh", "dah", "aja", "sip", "oke", "ok", "yes", "yoi", "iya"}:
+            return "yes"
+        return f"name:{label}"
+    m2 = _re.match(r"^nama\b\s+(.+)$", t, _re.I)
+    if m2:
+        label = m2.group(1).strip().strip(".,! -")
+        if not label or len(label) <= 3 or label.lower() in {"dong", "donk", "doh", "deh", "dah", "aja", "sip", "oke", "ok"}:
+            return "yes"
+        return f"name:{label}"
+    return "none"
+
+
 # ---------------------------------------------------------------------------
 # Transition detection + alert delivery
 # ---------------------------------------------------------------------------

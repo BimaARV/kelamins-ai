@@ -4,6 +4,7 @@ host quick-overview, and free-text memory/scrape detection hooks.
 
 from __future__ import annotations
 
+import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -11,6 +12,18 @@ from sqlalchemy.pool import StaticPool
 from app.db.base import Base
 from app.interfaces.context import build_situation_block, clear_history, get_history, push_history
 from app.interfaces.telegram import _detect_memory_request
+
+
+@pytest.fixture(autouse=True)
+def _redis_absent(monkeypatch):
+    """Pin Redis off so shared live keys never leak into these unit tests."""
+    from app.cache import get_redis as _get_redis
+    from app.interfaces import context as _ctx
+
+    monkeypatch.setattr(_ctx, "get_redis", lambda: None)
+    monkeypatch.setattr("app.cache.get_redis", lambda: None)
+    _ctx._history_fallback.clear()
+    yield
 
 
 @pytest_asyncio.fixture()
@@ -62,6 +75,29 @@ async def test_history_cap(monkeypatch):
     rows = await get_history("c")
     assert len(rows) == 4  # 2 exchanges * 2 roles
     assert rows[0]["content"] == "u3"
+
+
+async def test_build_news_briefing_only_recent(session):
+    from datetime import datetime, timedelta, timezone
+
+    from app.db.models import Article, Source
+    from app.interfaces.context import build_news_briefing
+
+    src = Source(name="Antara", base_url="https://antaranews.com", feed_url="https://antaranews.com/rss", enabled=True)
+    session.add(src)
+    await session.flush()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    session.add_all(
+        [
+            Article(source_id=src.id, title="Berita baru hari ini", url="https://a/1", published_at=now - timedelta(hours=2)),
+            Article(source_id=src.id, title="Berita basi 2025", url="https://a/2", published_at=datetime(2025, 7, 26, 10, 0)),
+        ]
+    )
+    await session.commit()
+    brief = await build_news_briefing(session, limit=5, max_hours=72)
+    assert "Berita baru hari ini" in brief
+    assert "Berita basi 2025" not in brief
+    assert "Antara" in brief
 
 
 # ---------------------------------------------------------------------------

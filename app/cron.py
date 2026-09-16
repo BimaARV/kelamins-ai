@@ -76,6 +76,11 @@ _DAY_TOMORROW_RE = re.compile(r"\bbesok\b", re.I)
 _DAY_TODAY_SPAN_RE = re.compile(r"\b(?:tiap|setiap)\s+hari\s+aja\b|\bbesok\b|\bhari\s+ini\b", re.I)
 
 _CANCEL_RE = re.compile(r"\b(hapus|hapusin|cancel|batal\w*|delete)\s+cron\w*\s+([a-z0-9]{2,12})\b", re.I)
+_EDIT_RE = re.compile(
+    r"\b(?:ubah|ganti|edit|update|reschedule|revisi|gantiin)\s+(?:jadwal\s+)?cron\w*\s+([a-z0-9]{2,12})\b"
+    r"(?:\s+(?:jadi|ke|menjadi|to|pesannya|isinya)\s+)?(.*)$",
+    re.I,
+)
 _LIST_RE = re.compile(r"^\s*(?:list|lihat|daftar|show)?\s*crons?\s*$", re.I)
 
 _INTENT_WORDS = [
@@ -257,6 +262,14 @@ def cron_manage_request(text: str) -> tuple[str, str]:
     return "", ""
 
 
+def cron_edit_request(text: str) -> tuple[str, str, str]:
+    """Detect edit requests in free text: (action, job_id, payload)."""
+    m = _EDIT_RE.search(text)
+    if m:
+        return "edit", m.group(1), (m.group(2) or "").strip()
+    return "", "", ""
+
+
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
@@ -361,6 +374,43 @@ async def delete_job(job_id: str) -> bool:
     if len(jobs) == len(current):
         return False
     return await save_jobs(jobs)
+
+
+async def edit_job(job_id: str, payload: str, chat_id: str | int):
+    """Edit an existing cron job.
+
+    ``payload`` may be a new schedule ("besok jam 7 pagi") and/or a new message
+    (the schedule is kept when no time is present). Returns
+    ``(status, job_or_None, hint)`` with status one of
+    ``ok | missing | no_time | past | not_cron | redis_unavailable``.
+    """
+    let = _local_now()
+    jobs = await list_jobs()
+    job = next((j for j in jobs if j.get("id") == job_id), None)
+    if job is None:
+        return "missing", None, ""
+    payload = (payload or "").strip()
+    if not payload:
+        return "no_time", None, (
+            f"{bold('Cron edit')} — mau diubah jadi apa? Contoh: "
+            f"{mono('/cron edit <id> besok jam 7 pagi')} atau 'ubah cron <id> jadi ingetin minum air'."
+        )
+    res = build_cron_from_text(f"cron {payload}", str(chat_id), now=let)
+    if res.kind == "no_time":
+        job["message"] = payload.strip(" .,;:!?·—–-")
+    elif res.kind == "past":
+        return "past", None, res.hint
+    elif res.kind == "not_cron":
+        return "not_cron", None, ""
+    else:
+        j = res.job
+        job["message"] = j["message"]
+        job["next_run"] = j["next_run"]
+        job["repeat"] = j["repeat"]
+        job["weekday"] = j["weekday"]
+        job["schedule_label"] = j.get("schedule_label")
+    saved = await save_jobs(jobs)
+    return ("ok" if saved else "redis_unavailable"), job, ""
 
 
 async def fire_due_crons(send: Callable[[str, str], Awaitable[None]]) -> int:

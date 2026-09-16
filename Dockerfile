@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         iputils-ping ca-certificates \
-        iproute2 traceroute net-tools \
+        iproute2 traceroute net-tools procps util-linux hostname \
         libcap2-bin \
         tesseract-ocr tesseract-ocr-ind tesseract-ocr-eng \
         libgl1 libglib2.0-0 \

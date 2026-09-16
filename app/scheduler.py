@@ -247,6 +247,12 @@ async def main() -> None:
         await sync_source_fixtures(session)
         await seed_weather_locations_if_empty(session)
         await sync_weather_locations_if_missing(session)
+        from app.db.repo import purge_stale_articles
+
+        try:
+            await purge_stale_articles(session)
+        except Exception:  # noqa: BLE001
+            logger.warning("purge_stale_articles gagal saat start", exc_info=True)
 
     logger.info("kela scheduler starting (env=%s)", settings.app_env)
     await asyncio.gather(

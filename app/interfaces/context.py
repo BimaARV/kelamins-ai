@@ -27,6 +27,7 @@ from app.db.models import (
     Article,
     NetworkCheck,
     NetworkTarget,
+    Source,
     WeatherForecast,
     WeatherLocation,
 )
@@ -128,6 +129,37 @@ async def _weather_lines(session: AsyncSession, limit: int = 3) -> list[str]:
         temp = f"{f.temperature_c:.1f}C" if f.temperature_c is not None else "?"
         lines.append(f"  cuaca {loc.name}: {f.weather_description or 'n/a'} {temp}")
     return lines
+
+
+async def build_news_briefing(
+    session: AsyncSession, limit: int | None = None, max_hours: int | None = None
+) -> str:
+    """Recent headlines (≤ ``max_hours``) as plain-text lines for AI grounding.
+
+    Topic-agnostic — latest of whatever the collectors have, so the AI can
+    discuss any subject without inventing facts. Injected into the system
+    prompt on every AI turn (not rendered to Telegram, no HTML escaping).
+    """
+    limit = limit or max(int(settings.news_briefing_match_limit or 5), 1)
+    hours = max_hours if max_hours is not None else max(int(settings.news_max_age_hours or 72), 1)
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)
+    rows = (
+        await session.execute(
+            select(Article.title, Source.name.label("source_name"), Article.published_at, Article.scraped_at)
+            .join(Source, Article.source_id == Source.id, isouter=True)
+            .where(func.coalesce(Article.published_at, Article.scraped_at) >= cutoff)
+            .order_by(desc(func.coalesce(Article.published_at, Article.scraped_at)))
+            .limit(limit)
+        )
+    ).all()
+    if not rows:
+        return ""
+    lines = []
+    for title, src_name, published, scraped in rows:
+        when = published or scraped
+        when_s = when.strftime("%d %b, %H:%M") if when else "?"
+        lines.append(f"  berita: {title[:140]} [{src_name or 'n/a'} · {when_s}]")
+    return "\n".join(lines)
 
 
 async def build_situation_block(session: AsyncSession) -> str:

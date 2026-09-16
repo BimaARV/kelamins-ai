@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 
 from app.interfaces.formatter import bold, esc, mono, num
 
@@ -20,6 +21,26 @@ HOST_ROOT = "/host-root"
 _IGNORE_IFACE = re.compile(
     r"^(lo|docker\d*|veth[0-9a-f]*|br-|virbr\d*|dummy|sit[0-9]*|tun\d*|tap\d*|gretap|anyso|ip6tnl|wlan[0-9]+(?:\.\d+)*wl)"  # noqa: E501
 )
+
+# First-seen counter + timestamp per interface → cheap lazy 'sejak bot start' average.
+_NET_FIRST: dict[str, tuple[float, int, int]] = {}
+
+
+def format_rate(mbps: float) -> str:
+    """Render a Mbps value with auto unit (Mbps / Kbps / bps)."""
+    if mbps is None or mbps != mbps or mbps < 0:
+        return "0 bps"
+    if mbps >= 1:
+        return f"{mbps:.2f} Mbps"
+    kbps = mbps * 1000
+    if kbps >= 1:
+        return f"{kbps:.1f} Kbps"
+    return f"{mbps * 1_000_000:.0f} bps"
+
+
+def reset_net_first() -> None:
+    """Drop interface first-seen samples (used by tests / on loop restart)."""
+    _NET_FIRST.clear()
 
 
 async def _read_proc(name: str) -> str:
@@ -137,11 +158,16 @@ def parse_netdev(text: str) -> dict[str, tuple[int, int]]:
     return result
 
 
-async def collect_network_speeds(sample_seconds: float = 0.5) -> dict[str, dict]:
-    """Sample /proc/net/dev twice → ``{iface: {rx_mbps, tx_mbps}}`` (real ifaces)."""
+async def collect_network_speeds(sample_seconds: float = 2.0) -> dict[str, dict]:
+    """Sample /proc/net/dev twice → per-iface speed + lazy session averages.
+
+    Returns ``{iface: {rx_mbps, tx_mbps, rx, tx (bps), rx_total_mb, tx_total_mb,
+    rx_avg, tx_avg (Mbps, sejak bot start, once enough time elapsed)}}``.
+    """
     a0 = parse_netdev(await _read_proc("net/dev"))
     await asyncio.sleep(sample_seconds)
     a1 = parse_netdev(await _read_proc("net/dev"))
+    now = time.time()
     speeds: dict[str, dict] = {}
     for iface, (rx1, tx1) in a1.items():
         if _IGNORE_IFACE.match(iface) or iface not in a0:
@@ -151,10 +177,23 @@ async def collect_network_speeds(sample_seconds: float = 0.5) -> dict[str, dict]
         tx_bps = (tx1 - tx0) / sample_seconds
         if rx_bps < 0 or tx_bps < 0:
             continue
-        speeds[iface] = {
+        info: dict = {
+            "rx": rx_bps,
+            "tx": tx_bps,
             "rx_mbps": round(rx_bps / 1e6, 2),
             "tx_mbps": round(tx_bps / 1e6, 2),
+            "rx_total_mb": rx1 / 1e6,
+            "tx_total_mb": tx1 / 1e6,
         }
+        first = _NET_FIRST.get(iface)
+        if first:
+            t0, frx, ftx = first
+            d = now - t0
+            if d >= sample_seconds * 0.9 and rx1 >= frx and tx1 >= ftx and d > 0:
+                info["rx_avg"] = (rx1 - frx) / d / 1e6
+                info["tx_avg"] = (tx1 - ftx) / d / 1e6
+        speeds[iface] = info
+        _NET_FIRST[iface] = (now, rx1, tx1)
     return speeds
 
 
@@ -181,6 +220,26 @@ async def collect_disk() -> dict | None:
 # ---------------------------------------------------------------------------
 # Aggregation + formatting
 # ---------------------------------------------------------------------------
+
+_SYSINFO_RE = re.compile(
+    r"\b(?:sysinfo|system[-\s]?info|info\s+(?:server|sistem)|kondisi\s+(?:server|sistem)"
+    r"|status(?:\s+(?:server|sistem))?|ngintip\s+(?:server|sistem))\b",
+    re.I,
+)
+_SYSINFO_QUEST_RE = re.compile(
+    r"\b(?:berapa|gimana|bagaimana|cek|lihat|liat|tampilin)\s+"
+    r"(?:cpu|ram|memory|memori|disk|storage|uptime|core|procie)\b",
+    re.I,
+)
+
+
+def detect_sysinfo_request(text: str) -> bool:
+    """True when a free-text message asks for host info (like /sysinfo)."""
+    low = (text or "").strip().lower()
+    if not low or low.startswith("/"):
+        return False
+    return bool(_SYSINFO_RE.search(low)) or bool(_SYSINFO_QUEST_RE.search(low))
+
 
 async def quick_overview() -> str:
     """One-line host snapshot for AI grounding — no CPU/network sampling.
@@ -257,9 +316,18 @@ def format_status(stats: dict, db_counts: dict | None) -> str:
 
     net = stats.get("network") or {}
     rx, tx = _net_totals(net)
-    lines.append(f"  Network: {mono(f'↓ {rx} Mbps · ↑ {tx} Mbps')}")
+    line = f"  Network: {mono(f'↓ {format_rate(rx)} · ↑ {format_rate(tx)}')}"
+    with_avg = [v for v in net.values() if "rx_avg" in v and "tx_avg" in v]
+    if with_avg:
+        arx = sum(v["rx_avg"] for v in with_avg)
+        atx = sum(v["tx_avg"] for v in with_avg)
+        line += f" · avg sejak bot start: ↓ {format_rate(arx)} · ↑ {format_rate(atx)}"
+    lines.append(line)
     for iface, v in sorted(net.items()):
-        lines.append(f"    {esc(iface)}: ↓ {num(v['rx_mbps'],2)} · ↑ {num(v['tx_mbps'],2)} Mbps")
+        per = f"    {esc(iface)}: ↓ {format_rate(v['rx_mbps'])} · ↑ {format_rate(v['tx_mbps'])}"
+        if "rx_avg" in v and "tx_avg" in v:
+            per += f" · avg ↓ {format_rate(v['rx_avg'])} · ↑ {format_rate(v['tx_avg'])}"
+        lines.append(per)
 
     if db_counts:
         first = " · ".join(

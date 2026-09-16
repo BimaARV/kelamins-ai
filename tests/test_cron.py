@@ -9,6 +9,7 @@ from app.cron import (
     _ACK_OPENERS,
     build_cron_from_text,
     compute_next_run,
+    cron_edit_request,
     cron_manage_request,
     format_ack,
     format_jobs_list,
@@ -184,3 +185,81 @@ def test_format_jobs_list_empty_and_filled():
     out = format_jobs_list([res.job])
     assert res.job["id"] in out
     assert "pulang" in out
+
+
+# ---------------------------------------------------------------------------
+# Cron edit (Phase 6.6)
+# ---------------------------------------------------------------------------
+
+def test_cron_edit_request_detection():
+    assert cron_edit_request("ubah cron a1b2c3 jadi besok jam 7 pagi") == ("edit", "a1b2c3", "besok jam 7 pagi")
+    assert cron_edit_request("gantiin jadwal cron zz99 besok jam 6") == ("edit", "zz99", "besok jam 6")
+    assert cron_edit_request("ingetin pulang jam 17") == ("", "", "")
+    assert cron_edit_request("") == ("", "", "")
+
+
+class _FakeRedis:
+    def __init__(self, store: dict | None = None):
+        self._store: dict = store if store is not None else {}
+
+    async def get(self, key):
+        return self._store.get(key)
+
+    async def set(self, key, value):
+        self._store[key] = value
+        return True
+
+    async def delete(self, key):
+        self._store.pop(key, None)
+        return True
+
+
+def _job(id: str = "aa11bb", message: str = "test", repeat: str = "once", weekday=None, hour=8, minute=0):
+    from datetime import timedelta
+    now = _now(2026, 9, 16, 6, 0)
+    nxt = now.replace(hour=hour, minute=minute)
+    if nxt <= now:
+        nxt += timedelta(days=1)
+    return {
+        "id": id,
+        "message": message,
+        "next_run": nxt.timestamp(),
+        "repeat": repeat,
+        "weekday": weekday,
+        "chat_id": "1",
+        "created_at": now.timestamp(),
+        "schedule_label": "Hari ini (sekali)" if repeat == "once" else "Tiap hari",
+    }
+
+
+import json as _json
+
+
+async def test_edit_job_updates_schedule(monkeypatch):
+    from app import cron
+    store = {"bot:cron:jobs": _json.dumps([_job()])}
+    monkeypatch.setattr(cron, "_get_redis", lambda: _FakeRedis(store))
+    status, job, hint = await cron.edit_job("aa11bb", "besok jam 7 pagi", "1")
+    assert status == "ok"
+    nxt = datetime.fromtimestamp(job["next_run"], WIB)
+    assert nxt.hour == 7 and nxt.minute == 0
+    assert job["repeat"] == "once"
+
+
+async def test_edit_job_missing(monkeypatch):
+    from app import cron
+    store = {"bot:cron:jobs": _json.dumps([])}
+    monkeypatch.setattr(cron, "_get_redis", lambda: _FakeRedis(store))
+    status, job, hint = await cron.edit_job("nope", "besok jam 7 pagi", "1")
+    assert status == "missing" and job is None
+
+
+async def test_edit_job_message_only(monkeypatch):
+    from app import cron
+    original = _job()
+    store = {"bot:cron:jobs": _json.dumps([original])}
+    monkeypatch.setattr(cron, "_get_redis", lambda: _FakeRedis(store))
+    status, job, hint = await cron.edit_job(original["id"], "minum kopi", "1")
+    assert status == "ok"
+    assert job["message"] == "minum kopi"
+    assert job["next_run"] == original["next_run"]

@@ -42,6 +42,12 @@ class Settings(BaseSettings):
         default='["olahraga", "sport", "sepakbola", "f1", "motogp", "bola"]',
         alias="NEWS_SPORT_SOURCE_KEYWORDS",
     )
+    # News recency: articles older than this many hours are never stored or shown
+    # (cleans January-2025 backlog feeds like Antara Olahraga). 0 = no limit.
+    news_max_age_hours: int = Field(default=72, alias="NEWS_MAX_AGE_HOURS")
+    # News briefing for AI discussion (free-text OOT grounding).
+    news_briefing_match_limit: int = Field(default=5, alias="NEWS_BRIEFING_MATCH_LIMIT")
+    news_briefing_desc_chars: int = Field(default=300, alias="NEWS_BRIEFING_DESC_CHARS")
     network_target_fixtures: str = Field(default="[]", alias="NETWORK_TARGET_FIXTURES")
 
     # BMKG weather forecasts (Jakarta-Depok configured via WEATHER_LOCATIONS)
@@ -134,6 +140,15 @@ class Settings(BaseSettings):
     )
     monitor_ids_key_ttl_seconds: int = Field(
         default=31_536_000, alias="NETWORK_MONITOR_IDS_TTL_SECONDS"  # 365 hari
+    )
+    monitor_name_prompt_ttl_seconds: int = Field(
+        default=900, alias="MONITOR_NAME_PROMPT_TTL_SECONDS"  # 15 menit
+    )
+
+    # Host executor (Phase 6.6 - root + allowlist): file ops + benign commands
+    # through the bot container on the real host root (bind /host-root:rw).
+    hostcmd_allowed_roots: str = Field(
+        default='["/home", "/tmp", "/var/log"]', alias="HOSTCMD_ALLOWED_ROOTS"
     )
 
     # Jarvis memory (persistent, golden recorded actions + explicit notes)

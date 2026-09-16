@@ -348,6 +348,21 @@ async def test_documents_empty(session):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+async def test_monitor_edit_command(session):
+    from app.interfaces.commands import dispatch
+    from app.monitoring import upsert_monitor_target
+
+    await upsert_monitor_target(session, "8.8.8.8")
+    out = await dispatch("/monitor edit 8.8.8.8 nama DNS GOOGLE", session)
+    assert "Monitor diubah" in out
+    assert "DNS GOOGLE" in out
+    out2 = await dispatch("/monitor edit 1.1.1.1 nama X", session)
+    assert "tidak aktif" in out2.lower() or "tidak ditemukan" in out2.lower()
+    out3 = await dispatch("/monitor edit 8.8.8.8", session)
+    assert "gak ada param" in out3.lower() or "pakai" in out3.lower()
+
+
+@pytest.mark.asyncio
 async def test_weather_empty(session):
     from app.interfaces.commands import dispatch
     out = await dispatch("/weather", session)

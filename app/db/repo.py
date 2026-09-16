@@ -7,10 +7,10 @@ collected. No AI is involved in this module.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -230,20 +230,56 @@ async def upsert_weather_forecasts(
 
 async def store_raw_articles(session: AsyncSession, items: list[dict]) -> int:
     """Insert raw articles, skipping rows whose URL already exists (dedup by
-    unique URL in Phase 1; content-hash dedup arrives in the Event Engine)."""
-    stored = 0
+    unique URL in Phase 1; content-hash dedup arrives in the Event Engine).
+
+    Articles older than ``NEWS_MAX_AGE_HOURS`` (by their published_at) are
+    skipped entirely so stale feed backlog (e.g. a 2025 item served by a feed
+    in 2026) never re-enters the database.
+    """
+    max_age_hours = int(settings.news_max_age_hours or 0)
+    cutoff = None
+    if max_age_hours > 0:
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=max_age_hours)
+    stored = skipped = 0
     for item in items:
         existing = (await session.execute(select(Article.id).where(Article.url == item["url"]))).first()
         if existing:
             continue
+        pub = item.get("published_at")
+        if cutoff is not None and pub is not None and pub < cutoff:
+            skipped += 1
+            continue
         session.add(Article(**item))
         stored += 1
+    if skipped:
+        logger.info("store_raw_articles: skipped %d stale item(s) older than %dh", skipped, max_age_hours)
     try:
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
         logger.warning("integrity error while storing articles: %s", exc)
     return stored
+
+
+async def purge_stale_articles(session: AsyncSession, max_age_hours: int | None = None) -> int:
+    """Delete articles older than NEWS_MAX_AGE_HOURS (by published_at).
+
+    Keeps the ``articles`` table clean of stale backlog that was ingested
+    before the recency filter existed. Runs once at scheduler startup
+    (idempotent) and on demand. Returns the number of rows removed.
+    """
+    max_age_hours = max_age_hours if max_age_hours is not None else int(settings.news_max_age_hours or 0)
+    if max_age_hours <= 0:
+        return 0
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=max_age_hours)
+    result = await session.execute(
+        delete(Article).where(Article.published_at.is_not(None), Article.published_at < cutoff)
+    )
+    await session.commit()
+    removed = result.rowcount or 0
+    if removed:
+        logger.info("purge_stale_articles: removed %d article(s) older than %dh", removed, max_age_hours)
+    return removed
 
 
 async def upsert_earthquake(session: AsyncSession, fact: dict | None) -> bool:

@@ -16,25 +16,34 @@ from app.db.base import Base
 from app.db.models import NetworkTarget, TargetType
 from app.interfaces.commands import _monitor, monitoring_list
 from app.monitoring import (
+    clear_monitor_name_pending,
+    detect_monitor_edit,
     detect_monitor_start,
     detect_monitor_stop,
+    get_monitor_name_pending,
     get_monitor_status,
     is_monitor_target,
     is_monitored,
     maybe_notify_monitor,
+    parse_monitor_command,
     remove_monitor_state,
+    resolve_monitor_name_prompt,
+    set_monitor_name_pending,
     set_monitored,
     set_monitor_status,
+    update_monitor_target,
     upsert_monitor_target,
 )
 
 
 @pytest.fixture(autouse=True)
-def _clean_state():
-    from app.monitoring import _MEM_FALLBACK
+def _clean_state(monkeypatch):
+    from app.monitoring import _MEM_FALLBACK, _PENDING_FALLBACK
 
     _MEM_FALLBACK["ids"] = set()
     _MEM_FALLBACK["status"] = {}
+    _PENDING_FALLBACK.clear()
+    monkeypatch.setattr("app.monitoring._redis", lambda: None)
     yield
 
 
@@ -251,3 +260,60 @@ async def test_monitor_command_list_and_invalid(session):
     assert "gak valid" in reply.lower() or "valid" in reply.lower()
     reply = await _monitor(session, "list")
     assert "belum ada target" in reply
+
+
+# ---------------------------------------------------------------------------
+# Monitor naming + edit (Phase 6.6)
+# ---------------------------------------------------------------------------
+
+def test_parse_monitor_command_with_label():
+    assert parse_monitor_command("8.8.8.8 nama RO UNIV") == ("8.8.8.8", "RO UNIV")
+    assert parse_monitor_command("8.8.8.8") == ("8.8.8.8", None)
+    assert parse_monitor_command("monitor 8.8.8.8 nama DNS GOOGLE") == ("8.8.8.8", "DNS GOOGLE")
+    assert parse_monitor_command("") == ("", None)
+
+
+def test_detect_monitor_edit():
+    assert detect_monitor_edit("ubah monitor 8.8.8.8 jadi nama DNS GOOGLE") == (
+        "8.8.8.8", {"name": "DNS GOOGLE"},
+    )
+    assert detect_monitor_edit(
+        "ganti monitoring 114.120.14.5 jadi interval 120 timeout 10"
+    ) == ("114.120.14.5", {"interval": 120, "timeout": 10})
+    assert detect_monitor_edit("monitor 8.8.8.8 terus aja") is None
+    assert detect_monitor_edit("tolong cek 8.8.8.8") is None
+
+
+def test_resolve_monitor_name_prompt():
+    assert resolve_monitor_name_prompt("Ngga usah") == "decline"
+    assert resolve_monitor_name_prompt("gak") == "decline"
+    assert resolve_monitor_name_prompt("batalin aja") == "none"
+    assert resolve_monitor_name_prompt("Ya") == "yes"
+    assert resolve_monitor_name_prompt("iya donk") == "yes"
+    assert resolve_monitor_name_prompt("ya dong") == "yes"
+    assert resolve_monitor_name_prompt("Ya, nama RO UNIV") == "name:RO UNIV"
+    assert resolve_monitor_name_prompt("nama POLI TELKOM") == "name:POLI TELKOM"
+    assert resolve_monitor_name_prompt("berita apa hari ini?") == "none"
+    assert resolve_monitor_name_prompt("/status") == "none"
+    assert resolve_monitor_name_prompt("") == "none"
+
+
+async def test_update_monitor_target_name_and_ranges(session):
+    await upsert_monitor_target(session, "8.8.8.8")
+    row, detail = await update_monitor_target(session, "8.8.8.8", name="DNS GOOGLE")
+    assert row is not None and row.name == "DNS GOOGLE"
+    assert "nama" in detail
+    row2, detail2 = await update_monitor_target(session, "8.8.8.8", interval=5)
+    assert row2 is None
+    assert "10" in detail2
+    row3, _ = await update_monitor_target(session, "8.8.8.8", timeout=2)
+    assert row3 is not None and row3.timeout_seconds == 2
+    missing, detail3 = await update_monitor_target(session, "1.1.1.1", name="x")
+    assert missing is None
+
+
+async def test_set_monitor_name_and_pending_roundtrip():
+    await set_monitor_name_pending("c1", "8.8.8.8")
+    assert await get_monitor_name_pending("c1") == "8.8.8.8"
+    await clear_monitor_name_pending("c1")
+    assert await get_monitor_name_pending("c1") is None

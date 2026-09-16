@@ -63,11 +63,13 @@ services:
       DATABASE_URL: mysql+asyncmy://${MARIADB_USER}:${MARIADB_PASSWORD}@127.0.0.1:2407/${MARIADB_DATABASE}
       REDIS_URL: redis://127.0.0.1:2408/0
     network_mode: host
+    # Root + read-write /:host-root → allowlist-only host access via app/hostcmd.py
+    user: root
     depends_on:
       mariadb:
         condition: service_healthy
     volumes:
-      - /:/host-root:ro
+      - /:/host-root:rw
       - kela_documents:/app/storage/documents
       - kela_reports:/app/storage/reports
       - kela_images:/app/storage/images

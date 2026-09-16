@@ -89,6 +89,21 @@ def test_system_prompt_encourages_readable_formatting():
     assert "'→'" in system
 
 
+def test_system_prompt_allows_oot_with_fact_opinion_split():
+    system = kela_system_prompt()
+    assert "OPINI/INTERPRETASI" in system
+    assert "FAKTA" in system
+    assert "asumsi" in system.lower()
+
+
+def test_system_prompt_deep_thinking_and_multiturn():
+    system = kela_system_prompt()
+    assert "DEEP THINKING" in system
+    assert "bertingkat" in system
+    assert "multi-turn" in system.lower()
+    assert "thread" in system.lower()
+
+
 def test_system_prompt_injects_asia_jakarta_now():
     from datetime import datetime
     from zoneinfo import ZoneInfo

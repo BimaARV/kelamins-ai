@@ -101,6 +101,62 @@ def test_format_status_disk_missing():
 
 
 # ---------------------------------------------------------------------------
+# format_rate (auto Kbps/Mbps/bps) + sysinfo intent
+# ---------------------------------------------------------------------------
+
+def test_format_rate_auto_unit():
+    from app.hoststats import format_rate
+
+    assert format_rate(12.5) == "12.50 Mbps"
+    assert format_rate(0.3) == "300.0 Kbps"
+    assert format_rate(0.0005) == "500 bps"
+    assert format_rate(0) == "0 bps"
+    assert format_rate(-1) == "0 bps"
+    assert format_rate(float("nan")) == "0 bps"
+
+
+def test_detect_sysinfo_request():
+    from app.hoststats import detect_sysinfo_request
+
+    assert detect_sysinfo_request("gimana kondisi server?") is True
+    assert detect_sysinfo_request("status") is True
+    assert detect_sysinfo_request("berapa cpu dan ram?") is True
+    assert detect_sysinfo_request("sysinfo") is True
+    assert detect_sysinfo_request("kondisi sistem baik?") is True
+    assert detect_sysinfo_request("cek 8.8.8.8") is False
+    assert detect_sysinfo_request("monitor 8.8.8.8") is False
+    assert detect_sysinfo_request("/status") is False
+    assert detect_sysinfo_request("") is False
+
+
+async def test_collect_network_speeds_session_avg(monkeypatch):
+    import time
+
+    from app import hoststats
+
+    snaps = [
+        "eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0",
+        "eth0: 1500 0 0 0 0 0 0 0 2500 0 0 0 0 0 0 0",
+    ]
+    calls = {"i": 0}
+
+    async def fake_read(name):
+        snap = snaps[min(calls["i"], len(snaps) - 1)]
+        calls["i"] += 1
+        return "Inter-|   Receive ...\n" + snap
+
+    monkeypatch.setattr(hoststats, "_read_proc", fake_read)
+    hoststats.reset_net_first()
+    hoststats._NET_FIRST["eth0"] = (time.time() - 10.0, 100, 100)
+    out = await hoststats.collect_network_speeds(sample_seconds=0.05)
+    v = out["eth0"]
+    assert v["rx_mbps"] == 0.01  # (1500-1000)/0.05 bytes→ 10000/1e6
+    assert v["tx_mbps"] == 0.01  # (2500-2000)/0.05
+    assert "rx_avg" in v and "tx_avg" in v
+    assert "rx_total_mb" in v and "tx_total_mb" in v
+
+
+# ---------------------------------------------------------------------------
 # netinfo normalizers
 # ---------------------------------------------------------------------------
 
