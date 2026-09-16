@@ -51,8 +51,9 @@ _DOMAIN_RE = re.compile(
 
 _MONITOR_INTENT = re.compile(
     r"("
-    r"\b(monitor(?:ing)?|pantau|awasi|amatin|intip|watch|uptime|always\s*on)\b"
-    r"|\b(?:ping|cek|monitor|pantau)\s+(?:terus|berkala|rutin|tiap)\b"
+    r"\b(?:monitor(?:ing|in|innya)?|memonitor|dimonitor(?:in)?"
+    r"|pantau(?:in|innya)?|dipantau(?:in)?|awasi(?:in|n)?|amatin|intip|watch|uptime|always\s*on)\b"
+    r"|\b(?:ping|cek|cekin|monitor|monitorin|pantau|pantauin)\b[^\n]{0,30}\b(?:terus|berkala|rutin|tiap)\b"
     r"|\b(?:kalo|kalau|kalok|jika)\b[^\n]{0,40}\b(?:down|mati|putus|turun)\b"
     r"|\b(?:alert|notif\w*)\b"
     r")",

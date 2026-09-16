@@ -514,6 +514,11 @@ _WHOIS_MAX_TOKENS = 6
 _WHOIS_QUESTION_RE = re.compile(
     r"\b(gimana|kenapa|kok|kapan|apa|berapa|cara|sering|selalu|timeout|error)\b"
 )
+_WHOIS_MONITOR_WORD_RE = re.compile(
+    r"\b(?:(?:di|me)?monitor\w*|(?:di|me)?pantau\w*|awasi\w*|cekin\w*"
+    r"|amatin|intip|watch|always\s*on)\b",
+    re.IGNORECASE,
+)
 
 
 def _detect_whois_request(text: str) -> str | None:
@@ -525,6 +530,8 @@ def _detect_whois_request(text: str) -> str | None:
         return None
     if "whois" in low or low == target:
         return target
+    if _WHOIS_MONITOR_WORD_RE.search(low):
+        return None
     tokens = low.split()
     if (
         len(tokens) <= _WHOIS_MAX_TOKENS

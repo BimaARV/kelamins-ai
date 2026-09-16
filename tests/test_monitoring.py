@@ -91,6 +91,19 @@ def test_detect_monitor_start_down_keyword():
     assert detect_monitor_start("cek 114.120.14.5 kalo down notif gua") == "114.120.14.5"
 
 
+def test_detect_monitor_start_colloquial_verbs():
+    assert detect_monitor_start("tolong monitorin ip 103.153.42.237") == "103.153.42.237"
+    assert detect_monitor_start("pantauin 192.168.1.1 ya") == "192.168.1.1"
+    assert detect_monitor_start("minta tolong dipantau IP 103.153.42.237") == "103.153.42.237"
+    assert detect_monitor_start("103.153.42.237 tolong dimonitorin") == "103.153.42.237"
+    assert detect_monitor_start("tolong awasin 103.153.42.237") == "103.153.42.237"
+    assert detect_monitor_start("cekin 8.8.8.8 terus") == "8.8.8.8"
+
+
+def test_detect_monitor_start_plain_cekin_no_repetition_no_intent():
+    assert detect_monitor_start("tolong cekin ip 103.153.42.237") is None
+
+
 def test_detect_monitor_stop():
     assert detect_monitor_start("stop monitoring 8.8.8.8") is None
     assert detect_monitor_stop("stop monitoring 8.8.8.8") == "8.8.8.8"

@@ -471,6 +471,17 @@ def test_detect_whois_request():
     )
 
 
+def test_detect_whois_request_not_hijack_monitor():
+    from app.interfaces.telegram import _detect_whois_request
+    assert _detect_whois_request("tolong monitorin ip 103.153.42.237") is None
+    assert _detect_whois_request("minta tolong dipantau IP 103.153.42.237") is None
+    assert _detect_whois_request("tolong awasin 103.153.42.237") is None
+    assert _detect_whois_request("103.153.42.237 tolong dimonitorin") is None
+    assert _detect_whois_request("cekin 8.8.8.8 terus") is None
+    assert _detect_whois_request("pantau 8.8.8.8 terus") is None
+    assert _detect_whois_request("tolong cekin ip 103.153.42.237") is None
+
+
 @pytest.mark.asyncio
 async def test_whois_command_usage_without_arg(session):
     from app.interfaces.commands import dispatch
