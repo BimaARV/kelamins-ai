@@ -37,6 +37,7 @@ from app.db.session import session_factory
 from app.event_engine import run_event_intelligence
 from app.kela_ai.gateway import AIUnavailable, build_gateway
 from app.kela_ai.services import pick_pending_events, process_event
+from app.monitoring import maybe_notify_monitor
 
 logger = logging.getLogger("kela.scheduler")
 
@@ -104,6 +105,11 @@ async def _loop_network() -> None:
                     result = await run_check(target)
                     await store_network_check(session, target.id, result)
                     last_run[target.id] = now
+                    if await maybe_notify_monitor(target, result):
+                        logger.info(
+                            "monitor transition alert sent target=%s status=%s",
+                            target.name, result["status"],
+                        )
                     logger.info(
                         "network check done target=%s status=%s latency=%s err=%s",
                         target.name, result["status"], result.get("latency_ms"),

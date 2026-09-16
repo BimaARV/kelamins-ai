@@ -6,6 +6,7 @@ earthquakes, network summary, top news and watchlist weather.
 from __future__ import annotations
 
 import datetime as _dt
+import random
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import desc, func, select
@@ -26,10 +27,17 @@ DIGEST_NEWS_LIMIT = 3
 DIGEST_WEATHER_LIMIT = 5
 DIGEST_CUTOFF_HOURS = 24
 
+_DIGEST_GREETINGS = [
+    "Pagi bro, selamat beraktivitas. Nih ringkasan semalam:",
+    "Good morning, aight — ini kondisi semalam:",
+    "Pagi! Semoga kopi lo masih anget. Status semalam:",
+]
+
 
 async def build_digest(session: AsyncSession) -> str:
     now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
     lines = [
+        f"{random.choice(_DIGEST_GREETINGS)}\n",
         bold(f"KELA Morning Digest — {dt_wib(now)}\n"),
     ]
 

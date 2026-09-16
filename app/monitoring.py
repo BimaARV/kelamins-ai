@@ -1,0 +1,361 @@
+"""Chat-driven network monitoring with down/up Telegram alerts.
+
+The scheduler owns the actual pinging (a single ping authority): ``_loop_network``
+runs ``run_check`` → ``store_network_check`` for every enabled target. This
+module only *decides* what to alert about:
+
+  * detects monitoring requests in free text (public/private IP or domain),
+  * upserts ``NetworkTarget`` rows so the scheduler picks them up,
+  * keeps the last known status per target in Redis,
+  * fires a Telegram alert ONLY on a real up ↔ down transition.
+
+Redis keys (db 0):
+  bot:monitor:ids                       — SET of target ids opted in from chat
+  bot:monitor:status:<target_id>        — last raw status ("up"/"down"/"timeout"/"error")
+
+The status key also acts as the opt-in marker for the scheduler. A scheduler
+restart never causes an alert storm: the first pass just re-seeds the status.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import logging
+import random
+import re
+from datetime import datetime
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import httpx
+
+from app.cache import get_redis
+from app.config import settings
+from app.db.models import NetworkTarget, TargetType
+from app.interfaces.formatter import bold, esc, mono
+from app.whois import extract_domain, extract_ip
+
+logger = logging.getLogger(__name__)
+
+TELEGRAM_API = "https://api.telegram.org"
+
+MONITOR_IDS_KEY = "bot:monitor:ids"
+MONITOR_STATUS_KEY = "bot:monitor:status:{}"
+MONITOR_STATE_TTL = 30 * 24 * 3600  # refreshed below from settings
+
+_IP_LOOPBACK_TEST = re.compile(r"^127\.|^0\.|^255\.|^224\.|^169\.254\.")
+_DOMAIN_RE = re.compile(
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}"
+)
+
+_MONITOR_INTENT = re.compile(
+    r"("
+    r"\b(monitor(?:ing)?|pantau|awasi|amatin|intip|watch|uptime|always\s*on)\b"
+    r"|\b(?:ping|cek|monitor|pantau)\s+(?:terus|berkala|rutin|tiap)\b"
+    r"|\b(?:kalo|kalau|kalok|jika)\b[^\n]{0,40}\b(?:down|mati|putus|turun)\b"
+    r"|\b(?:alert|notif\w*)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_MONITOR_CANCEL = re.compile(
+    r"("
+    r"\b(?:stop|berhenti|berhentiin|berhentikan|batalin|batalkan|matiin|nonaktifin|hapus)\b"
+    r"[^\n]{0,30}\b(?:monitor\w*|pantau|pantauin|pantauan|awasi|amatin|cek)\b"
+    r"|\b(?:monitor|monitoring|pantau|awasi)\s+(?:stop|berhenti|matiin|off|jangan|hapus)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_MEM_FALLBACK: dict[str, set[int] | dict[int, str]] = {
+    "ids": set(),
+    "status": {},
+}
+
+
+def _state_ttl() -> int:
+    return max(int(settings.monitor_state_ttl_seconds or 2_592_000), 3600)
+
+
+def _ids_ttl() -> int:
+    return max(int(settings.monitor_ids_key_ttl_seconds or 31_536_000), 86400)
+
+
+def is_monitor_target(value: str) -> bool:
+    """Accept a non-loopback IPv4 (public OR private) or a DNS domain."""
+    value = (value or "").strip().lower()
+    if not value:
+        return False
+    ip = extract_ip(value)
+    if ip is not None:
+        if _IP_LOOPBACK_TEST.match(ip):
+            return False
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return not addr.is_loopback and not addr.is_multicast and not addr.is_unspecified
+    return bool(extract_domain(value))
+
+
+def _extract_target(text: str) -> str | None:
+    """Pull the first usable target out of free text (IP wins over domain)."""
+    low = (text or "").lower()
+    low = re.sub(r"https?://[^\s]+", " ", low)
+    ip = extract_ip(low)
+    candidate = ip if ip is not None else extract_domain(low)
+    if candidate is None or not is_monitor_target(candidate):
+        return None
+    return candidate
+
+
+def detect_monitor_start(text: str) -> str | None:
+    if _MONITOR_CANCEL.search(text):
+        return None
+    if not _MONITOR_INTENT.search(text):
+        return None
+    return _extract_target(text)
+
+
+def detect_monitor_stop(text: str) -> str | None:
+    if not _MONITOR_CANCEL.search(text):
+        return None
+    return _extract_target(text)
+
+
+# ---------------------------------------------------------------------------
+# Redis state (with in-memory fallback so tests / degraded Redis still work)
+# ---------------------------------------------------------------------------
+
+
+def _redis() -> Any:
+    from app.cache import get_redis
+
+    return get_redis()
+
+
+async def is_monitored(target_id: int) -> bool:
+    try:
+        client = _redis()
+        if client is not None:
+            return bool(await client.sismember(MONITOR_IDS_KEY, str(target_id)))
+    except Exception:  # noqa: BLE001
+        logger.warning("monitor: redis unavailable (ids read)", exc_info=True)
+    ids = _MEM_FALLBACK.get("ids", set())
+    return int(target_id) in ids
+
+
+async def set_monitored(target_id: int) -> None:
+    try:
+        client = _redis()
+        if client is not None:
+            await client.sadd(MONITOR_IDS_KEY, str(target_id))
+            await client.expire(MONITOR_IDS_KEY, _ids_ttl())
+            return
+    except Exception:  # noqa: BLE001
+        logger.warning("monitor: redis unavailable (ids write)", exc_info=True)
+    _MEM_FALLBACK.setdefault("ids", set()).add(int(target_id))
+
+
+async def list_monitored_ids() -> list[int]:
+    try:
+        client = _redis()
+        if client is not None:
+            raw = await client.smembers(MONITOR_IDS_KEY)
+            ids = sorted(int(x) for x in (raw or set()))
+            return [i for i in ids if i > 0]
+    except Exception:  # noqa: BLE001
+        logger.warning("monitor: redis unavailable (ids list)", exc_info=True)
+    return sorted(_MEM_FALLBACK.get("ids", set()))
+
+
+async def get_monitor_status(target_id: int) -> str | None:
+    try:
+        client = _redis()
+        if client is not None:
+            raw = await client.get(MONITOR_STATUS_KEY.format(target_id))
+            return raw if isinstance(raw, str) else (raw.decode() if isinstance(raw, bytes) else None)
+    except Exception:  # noqa: BLE001
+        logger.warning("monitor: redis unavailable (status read)", exc_info=True)
+    return _MEM_FALLBACK.setdefault("status", {}).get(int(target_id))
+
+
+async def set_monitor_status(target_id: int, status: str) -> None:
+    try:
+        client = _redis()
+        if client is not None:
+            await client.set(MONITOR_STATUS_KEY.format(target_id), status, ex=_state_ttl())
+            return
+    except Exception:  # noqa: BLE001
+        logger.warning("monitor: redis unavailable (status write)", exc_info=True)
+    _MEM_FALLBACK.setdefault("status", {})[int(target_id)] = status
+
+
+async def remove_monitor_state(target_id: int) -> None:
+    try:
+        client = _redis()
+        if client is not None:
+            await client.srem(MONITOR_IDS_KEY, str(target_id))
+            await client.delete(MONITOR_STATUS_KEY.format(target_id))
+            return
+    except Exception:  # noqa: BLE001
+        logger.warning("monitor: redis unavailable (state remove)", exc_info=True)
+    _MEM_FALLBACK.setdefault("ids", set()).discard(int(target_id))
+    _MEM_FALLBACK.setdefault("status", {}).pop(int(target_id), None)
+
+
+# ---------------------------------------------------------------------------
+# Target persistence
+# ---------------------------------------------------------------------------
+
+
+async def get_target_by_string(session, target: str) -> NetworkTarget | None:
+    from sqlalchemy import select
+
+    result = await session.execute(
+        select(NetworkTarget).where(NetworkTarget.target == target).limit(1)
+    )
+    return result.scalars().first()
+
+
+async def upsert_monitor_target(session, target: str) -> tuple[NetworkTarget, bool]:
+    """Reuse an existing row (re-enable it) or insert a fresh ping target."""
+    existing = await get_target_by_string(session, target)
+    if existing is not None:
+        if not existing.enabled:
+            existing.enabled = True
+        await session.commit()
+        return existing, False
+    row = NetworkTarget(
+        name=target,
+        target_type=TargetType.ping,
+        target=target,
+        interval_seconds=60,
+        timeout_seconds=5,
+        enabled=True,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row, True
+
+
+async def disable_monitor_target(session, target: NetworkTarget) -> None:
+    target.enabled = False
+    await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Transition detection + alert delivery
+# ---------------------------------------------------------------------------
+
+_PERSONA_DOWN = [
+    "Bro, ada yang down nih di monitoring kita:",
+    "Woi perhatian — jaringan yang kita pantau putus:",
+    "KELA lapor: ada target yang gak kedengeran:",
+]
+_PERSONA_UP = [
+    "Update bagus dari monitoring:",
+    "Eh, targetnya balik lagi nih:",
+    "KELA lapor: udah pulih nih:",
+]
+
+
+def _bucket(status: str) -> str:
+    return "up" if (status or "").lower() == "up" else "down"
+
+
+async def maybe_notify_monitor(target: NetworkTarget, result: dict, chat_id: str | None = None) -> bool:
+    """Alert on a real up↔down transition. Returns True when an alert was sent.
+
+    Called by the scheduler right after ``store_network_check``. A missing
+    opt-in marker or an unchanged bucket → silently re-seeds and returns False.
+    """
+    if not await is_monitored(target.id):
+        return False
+    raw = result.get("status")
+    status = getattr(raw, "value", raw)
+    status = str(status).lower()
+    bucket = _bucket(status)
+
+    prev_raw = await get_monitor_status(target.id)
+    prev_bucket = _bucket(prev_raw) if prev_raw else None
+    await set_monitor_status(target.id, status)
+
+    if prev_bucket is None or prev_bucket == bucket:
+        return False
+
+    if bucket == "up":
+        body = await format_monitor_pulih(target, result)
+    else:
+        body = await format_monitor_down(target, result)
+    return await send_monitor_alert(body, chat_id=chat_id)
+
+
+async def _resolve_ip(target: str) -> str | None:
+    if extract_ip(target) is not None:
+        return target
+    try:
+        ip = await asyncio.to_thread(__import__("socket").gethostbyname, target)
+        return ip or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _detail_lines(target: NetworkTarget, result: dict) -> list[str]:
+    status = getattr(result.get("status"), "value", result.get("status"))
+    status = str(status).lower()
+    lines = [f"  Status: {mono(status)}"]
+    latency = result.get("latency_ms")
+    loss = result.get("packet_loss")
+    if latency is not None:
+        lines.append(f"  Latency: {float(latency):.0f} ms")
+    if loss is not None:
+        lines.append(f"  Loss: {esc(f'{loss:g}')}%")
+    err = result.get("error_message")
+    if err:
+        lines.append(f"  Alasan: {esc(str(err)[:200])}")
+    ip = await _resolve_ip(target.target)
+    if ip and ip != target.target:
+        lines.append(f"  Resolve: {mono(ip)}")
+    lines.append(f"  Waktu: {datetime.now(ZoneInfo('Asia/Jakarta')):%A, %d %b %Y, %H:%M WIB}")
+    return lines
+
+
+async def format_monitor_down(target: NetworkTarget, result: dict) -> str:
+    opener = random.choice(_PERSONA_DOWN)
+    name = target.name or target.target
+    lines = [f"{opener}", f"{bold('[DOWN] JARINGAN DOWN')} — {bold(esc(name))}"]
+    lines.extend(await _detail_lines(target, result))
+    return "\n".join(lines)
+
+
+async def format_monitor_pulih(target: NetworkTarget, result: dict) -> str:
+    opener = random.choice(_PERSONA_UP)
+    name = target.name or target.target
+    lines = [f"{opener}", f"{bold('[PULIH] JARINGAN KEMBALI')} — {bold(esc(name))}"]
+    lines.extend(await _detail_lines(target, result))
+    return "\n".join(lines)
+
+
+async def send_monitor_alert(body: str, chat_id: str | None = None) -> bool:
+    token = (settings.telegram_bot_token or "").strip()
+    cid = (chat_id or settings.telegram_chat_id or "").strip()
+    if not token or not cid:
+        logger.warning("monitor alert skipped - telegram credentials missing")
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{TELEGRAM_API}/bot{token}/sendMessage",
+                json={"chat_id": cid, "text": body, "parse_mode": "HTML"},
+            )
+        data = resp.json()
+        if resp.status_code != 200 or not data.get("ok"):
+            logger.warning("monitor alert failed: %s", data.get("description"))
+            return False
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception("monitor alert send error")
+        return False

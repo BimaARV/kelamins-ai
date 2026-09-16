@@ -64,6 +64,11 @@ HELP = (
     f"  /sysinfo    {esc('Metrik host: CPU/RAM/disk/network/uptime')}\n"
     f"  /status     {esc('Ringkasan sistem (host + DB)')}\n"
     f"  /status ai  {esc('Status AI gateway')}\n"
+    f"  /monitor   {esc('Mulai pantau target + auto-alert DOWN/PULIH (contoh: /monitor 8.8.8.8)')}\n"
+    f"  /monitor stop {esc('<IP|domain> — berhenti pantau')}\n"
+    f"  /monitor list {esc('Daftar target yang dipantau')}\n"
+    f"  /memory    {esc('Catatan memori yang gua simpan')}\n"
+    f"  /forget    {esc('<id> — hapus satu catatan memori')}\n"
     f"  /alerts     {esc('Alert terbaru')}\n"
     f"  /documents  {esc('Daftar dokumen')}\n"
     f"  /crons      {esc('Daftar cron/reminder aktif')}\n"
@@ -106,6 +111,9 @@ async def dispatch(text: str, session: AsyncSession) -> str:
         "/documents": _documents,
         "/crons": _crons,
         "/cron": _cron_cancel,
+        "/monitor": _monitor,
+        "/memory": _memory,
+        "/forget": _forget,
     }
     handler = table.get(cmd)
     if handler is None:
@@ -580,3 +588,158 @@ async def _cron_cancel(session: AsyncSession, arg: str) -> str:  # noqa: ARG001
             return f"{bold('Cron dihapus')} — {mono(esc(job_id))}.\n\n" + format_jobs_list(await list_jobs())
         return f"{bold('?')} Cron {mono(esc(job_id))} nggak ketemu."
     return format_jobs_list(await list_jobs()) + f"\n\nBatal: {mono('/cron cancel <id>')}"
+
+
+# ---------------------------------------------------------------------------
+# Chat-driven network monitoring (also used by telegram free-text intercept)
+# ---------------------------------------------------------------------------
+
+async def _monitor(session: AsyncSession, arg: str) -> str:
+    parts = (arg or "").strip().split(None, 1)
+    if not parts:
+        return await monitoring_list(session)
+    if parts[0].lower() in ("list", "ls"):
+        return await monitoring_list(session)
+    if parts[0].lower() in ("stop", "off", "hapus", "berhenti", "batalkan", "cancel", "matiin"):
+        target = parts[1].strip() if len(parts) > 1 else ""
+        return await stop_monitoring(session, target)
+    return await start_monitoring(session, parts[0].strip())
+
+
+async def start_monitoring(session: AsyncSession, target_str: str) -> str:
+    from app.collectors.network.checks import run_check
+    from app.db.repo import store_network_check
+    from app.memory import remember
+    from app.monitoring import (
+        is_monitor_target,
+        set_monitored,
+        set_monitor_status,
+        upsert_monitor_target,
+    )
+
+    target_str = (target_str or "").strip().lower()
+    if not is_monitor_target(target_str):
+        return (
+            f"{bold('Monitor')} — target gak valid.\n"
+            f"Kirim IP non-loopback atau domain. Contoh: {mono('/monitor 8.8.8.8')}"
+        )
+    row, _created = await upsert_monitor_target(session, target_str)
+    await set_monitored(row.id)
+    result = await run_check(row)
+    await store_network_check(session, row.id, result)
+    raw = getattr(result["status"], "value", result["status"])
+    status = str(raw).lower()
+    await set_monitor_status(row.id, status)
+    await remember(
+        session,
+        f"monitor {target_str} (status {status})",
+        kind="monitor",
+        source="chat",
+        meta={"target_id": row.id},
+    )
+    lines = [
+        f"{bold('Monitor aktif')} — {bold(esc(target_str))} dicek tiap {mono('60')} detik.",
+        "Alert DOWN/PULIH bakal dikirim otomatis.",
+        "",
+        f"Cek pertama: {_monitor_check_line(result)}",
+    ]
+    return "\n".join(lines)
+
+
+def _monitor_check_line(result: dict) -> str:
+    raw = result["status"]
+    status = str(getattr(raw, "value", raw)).lower()
+    parts = [f"status {mono(status)}"]
+    if result.get("latency_ms") is not None:
+        parts.append(f"{result['latency_ms']:.0f} ms")
+    if result.get("error_message"):
+        parts.append(esc(str(result["error_message"])[:140]))
+    return " · ".join(parts)
+
+
+async def stop_monitoring(session: AsyncSession, target_str: str) -> str:
+    from app.memory import remember
+    from app.monitoring import (
+        disable_monitor_target,
+        get_target_by_string,
+        is_monitor_target,
+        remove_monitor_state,
+    )
+
+    target_str = (target_str or "").strip().lower()
+    if not is_monitor_target(target_str):
+        return f"{bold('Monitor')} — target gak valid."
+    row = await get_target_by_string(session, target_str)
+    if row is None or not row.enabled:
+        return f"{bold('Monitor')} — {mono(esc(target_str))} gak lagi dipantau."
+    await disable_monitor_target(session, row)
+    await remove_monitor_state(row.id)
+    await remember(
+        session,
+        f"monitor {target_str} di-stop",
+        kind="monitor",
+        source="chat",
+        meta={"target_id": row.id},
+    )
+    return f"{bold('Monitor di-stop')} — {bold(esc(target_str))} gak bakal ditegur lagi."
+
+
+async def monitoring_list(session: AsyncSession) -> str:
+    from app.monitoring import list_monitored_ids
+
+    ids = await list_monitored_ids()
+    if not ids:
+        return (
+            f"{bold('Monitor')} — belum ada target yang dipantau.\n"
+            f"Contoh: {mono('/monitor 8.8.8.8')} atau {mono('/monitor 114.120.14.5')}"
+        )
+    subq = (
+        select(NetworkCheck.target_id, func.max(NetworkCheck.id).label("max_id"))
+        .where(NetworkCheck.target_id.in_(ids))
+        .group_by(NetworkCheck.target_id)
+        .subquery()
+    )
+    latest = (
+        await session.execute(select(NetworkCheck).join(subq, NetworkCheck.id == subq.c.max_id))
+    ).scalars().all()
+    by_tid = {c.target_id: c for c in latest}
+    targets = (
+        await session.execute(
+            select(NetworkTarget).where(NetworkTarget.id.in_(ids)).order_by(NetworkTarget.id)
+        )
+    ).scalars().all()
+    lines = [bold("Monitor aktif")]
+    for t in targets:
+        c = by_tid.get(t.id)
+        st = getattr(c.status, "value", c.status) if c else "belum dicek"
+        latency = f" · {c.latency_ms:.0f} ms" if c and c.latency_ms is not None else ""
+        lines.append(f"\n• {bold(esc(t.name))} — {mono(st)}{latency}")
+        lines.append(f"  #{t.id} · interval {t.interval_seconds}s · stop: /monitor stop {esc(t.name)}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Jarvis memory (/memory, /forget)
+# ---------------------------------------------------------------------------
+
+async def _memory(session: AsyncSession, arg: str) -> str:  # noqa: ARG001
+    from app.memory import format_memory_list, recall
+
+    return format_memory_list(await recall(session, limit=10))
+
+
+async def _forget(session: AsyncSession, arg: str) -> str:
+    from app.memory import forget
+
+    mem_id = (arg or "").strip()
+    if not mem_id.isdigit():
+        return f"{bold('Forget')} — kasih id-nya dong.\nContoh: {mono('/forget 12')}"
+    return await forget_memory(session, int(mem_id)) + f"\n\nLihat: {mono('/memory')}"
+
+
+async def forget_memory(session: AsyncSession, memory_id: int) -> str:
+    from app.memory import forget
+
+    if await forget(session, memory_id):
+        return f"{bold('Memory dihapus')} — #{memory_id}."
+    return f"{bold('?')} Memory #{memory_id} nggak ketemu."

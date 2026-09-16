@@ -25,6 +25,7 @@ TABLES = {
     "alert_messages",
     "alert_deliveries",
     "documents",
+    "memories",
 }
 
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -25,7 +26,9 @@ import httpx
 
 from app.config import settings
 from app.interfaces.formatter import bold, chunk_html, esc, md_to_html, mono
+from app.monitoring import detect_monitor_start, detect_monitor_stop
 from app.shell import format_server_command, parse_server_request, run_network_cmd
+from app.webscrape import detect_scrape_request, format_scrape, scrape_url
 from app.whois import (
     extract_domain,
     extract_ip,
@@ -180,10 +183,34 @@ async def _dispatch_text(text: str, chat_id: str, message_id: int) -> None:
 
 
 async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
-    """Route free-text to the KELA AI gateway for a conversational response."""
+    """Route free-text in order: shell → monitor → memory → scrape → whois → cron → AI."""
     shell_args = parse_server_request(text)
     if shell_args is not None:
         await _handle_server_cmd(shell_args, chat_id, message_id)
+        return
+
+    stop_target = detect_monitor_stop(text)
+    mon_target = None if stop_target is not None else detect_monitor_start(text)
+    if stop_target is not None or mon_target is not None:
+        from app.db.session import session_factory
+        from app.interfaces.commands import start_monitoring, stop_monitoring
+
+        async with session_factory() as session:
+            if stop_target is not None:
+                reply = await stop_monitoring(session, stop_target)
+            else:
+                reply = await start_monitoring(session, mon_target or "")
+        await send_message(chat_id, reply, reply_to=message_id)
+        return
+
+    mem_req = _detect_memory_request(text)
+    if mem_req is not None:
+        await _handle_remember(mem_req, chat_id, message_id)
+        return
+
+    scrape_target = detect_scrape_request(text)
+    if scrape_target is not None:
+        await _handle_scrape(scrape_target, chat_id, message_id)
         return
 
     whois_target = _detect_whois_request(text)
@@ -195,7 +222,8 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
         return
 
     from app.db.session import session_factory
-    from app.kela_ai.gateway import build_gateway, AIUnavailable
+    from app.interfaces.context import build_situation_block, get_history, push_history
+    from app.kela_ai.gateway import AIUnavailable, build_gateway
     from sqlalchemy import func, select
     from app.db.models import Article, Event, Earthquake, Alert
 
@@ -208,6 +236,7 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
             (Alert, "alerts"),
         ]:
             counts[label] = (await session.execute(select(func.count(model.id)))).scalar() or 0
+        situation = await build_situation_block(session)
 
     gw = build_gateway(settings)
     if not gw.configured:
@@ -240,15 +269,22 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
         f"{counts.get('earthquakes',0)} gempa, "
         f"{counts.get('alerts',0)} alerts."
     )
+    if situation:
+        system += f"\n\nKONDISI SEKARANG (pakai fakta ini, jangan ngarang):\n{situation}"
+    history = await get_history(chat_id)
     messages = [
         {"role": "system", "content": system},
+        *history,
         {"role": "user", "content": text},
     ]
     try:
         result = await gw.complete(messages, max_tokens=settings.ai_chat_max_tokens)
         content = result.content or ""
-        for i, part in enumerate(chunk_html(md_to_html(content))):
+        parts = list(chunk_html(md_to_html(content)))
+        for i, part in enumerate(parts):
             await send_message(chat_id, part, reply_to=message_id if i == 0 else None)
+        if parts:
+            await push_history(chat_id, text, " ".join(parts))
         await _maybe_send_file(text, content, chat_id)
     except AIUnavailable as exc:
         await send_message(
@@ -263,6 +299,61 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
             f"Terjadi error di AI gateway: {str(exc)[:200]}",
             reply_to=message_id,
         )
+
+
+# ---------------------------------------------------------------------------
+# Jarvis memory (free-text: "inget/catat/...", route BEFORE whois so short
+# phrases containing "ip/domain" are never hijacked into a WHOIS lookup)
+# ---------------------------------------------------------------------------
+
+_MEMORY_STORE_RE = re.compile(
+    r"^(inget|ingat|catat|hafal|simpen|simpan|remember|note)\b", re.IGNORECASE
+)
+
+
+def _detect_memory_request(text: str) -> str | None:
+    m = _MEMORY_STORE_RE.search((text or "").strip())
+    if not m:
+        return None
+    rest = (text or "").strip()[m.end():].strip(" .:,;-\t")
+    return rest if rest else None
+
+
+async def _handle_remember(content: str, chat_id: str, message_id: int) -> None:
+    from app.db.session import session_factory
+    from app.memory import remember
+
+    async with session_factory() as session:
+        mem = await remember(session, content, kind="note", source="chat")
+    if mem is None:
+        await send_message(
+            chat_id, "Itu udah gua catet sebelumnya, bro.", reply_to=message_id
+        )
+        return
+    await send_message(
+        chat_id,
+        f"{bold('Dicatet')} — {esc(content[:200])}\nLihat semua: /memory",
+        reply_to=message_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# On-demand web scraping from free text (no slash command needed)
+# ---------------------------------------------------------------------------
+
+async def _handle_scrape(url: str, chat_id: str, message_id: int) -> None:
+    from app.db.session import session_factory
+    from app.memory import remember
+
+    await send_typing(chat_id)
+    data = await scrape_url(url)
+    await send_message(chat_id, format_scrape(data), reply_to=message_id)
+    if not data.get("error"):
+        try:
+            async with session_factory() as session:
+                await remember(session, f"scrape {url}", kind="action", source="chat")
+        except Exception:  # noqa: BLE001
+            logger.debug("scrape memory skip", exc_info=True)
 
 
 async def _maybe_send_file(text: str, content: str, chat_id: str) -> None:
@@ -467,6 +558,14 @@ async def _set_last_news_push(ts: float) -> None:
             logger.warning("news push: redis unavailable, pakai in-memory", exc_info=True)
 
 
+_PUSH_OPENERS = [
+    "Bro, update berita nih:",
+    "Eh, ini yang lagi happening:",
+    "No cap, berita terbaru buat lo:",
+    "Santai dulu, nih beritanya:",
+]
+
+
 async def _push_latest_news() -> None:
     from app.db.session import session_factory
     from app.interfaces.commands import _render_news
@@ -478,8 +577,9 @@ async def _push_latest_news() -> None:
             tech_only=False,
             limit=NEWS_PUSH_COUNT,
         )
+    opener = random.choice(_PUSH_OPENERS)
     footer = "\n\nMau berita lain? Ketik /news, /news-tech, atau /news-sport."
-    await send_message(CHAT_ID, body + footer)
+    await send_message(CHAT_ID, f"{opener}\n\n{body}{footer}")
 
 
 async def news_push_loop() -> None:

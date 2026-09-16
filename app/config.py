@@ -128,6 +128,23 @@ class Settings(BaseSettings):
     telegram_chat_id: str | None = Field(default=None, alias="TELEGRAM_CHAT_ID")
     discord_webhook_url: str | None = Field(default=None, alias="DISCORD_WEBHOOK_URL")
 
+    # Chat-driven network monitoring (IP/domain, down/up Telegram alert)
+    monitor_state_ttl_seconds: int = Field(
+        default=2_592_000, alias="NETWORK_MONITOR_STATE_TTL_SECONDS"  # 30 hari
+    )
+    monitor_ids_key_ttl_seconds: int = Field(
+        default=31_536_000, alias="NETWORK_MONITOR_IDS_TTL_SECONDS"  # 365 hari
+    )
+
+    # Jarvis memory (persistent, golden recorded actions + explicit notes)
+    memory_max_items: int = Field(default=200, alias="MEMORY_MAX_ITEMS")
+    memory_recall_limit: int = Field(default=10, alias="MEMORY_RECALL_LIMIT")
+
+    # On-demand web scraping (free-text, SSRF-guarded)
+    web_scrape_max_bytes: int = Field(default=524_288, alias="WEB_SCRAPE_MAX_BYTES")
+    web_scrape_text_chars: int = Field(default=1800, alias="WEB_SCRAPE_TEXT_CHARS")
+    web_scrape_max_links: int = Field(default=6, alias="WEB_SCRAPE_MAX_LINKS")
+
     # Document Engine (Phase 5)
     tesseract_cmd: str = Field(default="/usr/bin/tesseract", alias="TESSERACT_CMD")
     document_storage_path: str = Field(default="storage/documents", alias="DOCUMENT_STORAGE_PATH")

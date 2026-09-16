@@ -545,6 +545,29 @@ class AlertDelivery(Base):
     alert_message: Mapped[AlertMessage] = relationship(back_populates="deliveries")
 
 
+class Memory(Base):
+    """Persistent assistant memory — actions KELA has done + explicit user notes.
+
+    Keeps the bot self-aware across restarts ('Jarvis feel'): every important
+    action (monitoring start/stop, down/up flips, cron, whois, file generation)
+    and every explicit 'inget/catat …' request lands here, then gets injected
+    into the AI system prompt on each free-text turn.
+    """
+
+    __tablename__ = "memories"
+    __table_args__ = (
+        Index("ix_memories_created_at", "created_at"),
+        Index("ix_memories_kind", "kind"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    content: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(String(30), default="note")
+    source: Mapped[str] = mapped_column(String(50), default="telegram")
+    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class Document(Base):
     """Uploaded or ingested document with extracted text and metadata.
 

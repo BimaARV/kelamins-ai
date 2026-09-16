@@ -182,6 +182,23 @@ async def collect_disk() -> dict | None:
 # Aggregation + formatting
 # ---------------------------------------------------------------------------
 
+async def quick_overview() -> str:
+    """One-line host snapshot for AI grounding — no CPU/network sampling.
+
+    Reads /proc files only (fast, sub-millisecond) so injecting it into every
+    free-text AI turn costs nothing. This text goes into the AI system prompt
+    (plain text), not to Telegram, so no HTML escaping is needed.
+    """
+    up = format_uptime(parse_uptime(await _read_proc("uptime")))
+    l1, l5, l15 = parse_loadavg(await _read_proc("loadavg"))
+    mem = parse_meminfo(await _read_proc("meminfo"))
+    disk = await collect_disk()
+    parts = [f"up {up}", f"load {l1:.1f}/{l5:.1f}/{l15:.1f}", f"RAM {mem['pct']:.1f}% terpakai"]
+    if disk:
+        parts.append(f"disk {disk['pct']:.1f}%")
+    return "Host: " + ", ".join(parts)
+
+
 async def collect_all() -> dict:
     cpu_task = collect_cpu_percent()
     net_task = collect_network_speeds()

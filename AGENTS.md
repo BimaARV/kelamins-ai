@@ -1,6 +1,6 @@
 # KELA AI — Project Notes & State (AGENTS.md)
 
-Monitoring bot dibangun phase-by-phase. Status di bawah ini TO-DATE saat terakhir ditulis (Phase 6 — Telegram interactive bot live & diverifikasi; persona+KELAMINS+/weather+/status ai fix+file generation+berita on-demand+whois RDAP+**bot host-network (ping/dns host)+/status host metrics+/alerts redesign+morning digest+reply keyboard+/asn+/geo-trace+/sysinfo, finance & /events dihapus**: session 2026-09-12). Kalau ada work baru yang selesai, update file ini.
+Monitoring bot dibangun phase-by-phase. Status di bawah ini TO-DATE saat terakhir ditulis (Phase 6 — **Jarvis upgrade: chat-driven monitoring + memori + scrape + grounding, session 2026-09-16**). Kalau ada work baru yang selesai, update file ini.
 
 ## Environment & Stack
 
@@ -21,6 +21,18 @@ Monitoring bot dibangun phase-by-phase. Status di bawah ini TO-DATE saat terakhi
 | 4 | Alert Engine (`app/alert_engine/`: priority, dedup, messages, channels) | ✅ live |
 | 5 | Multimodal & Documents (`app/documents/`, `app/vision/`) | ✅ live |
 | 6 | Interfaces — Telegram interactive bot (`app/interfaces/`) | ✅ live (Telegram; Discord + dashboard menyusul) |
+| 6.5 | Jarvis upgrade — chat-driven monitoring + memori + scrape + grounding (`app/monitoring.py`, `app/memory.py`, `app/webscrape.py`, `app/interfaces/context.py`) | ✅ live |
+
+### Phase 6.5 Jarvis upgrade (detail)
+
+- **Chat-driven network monitoring** (`app/monitoring.py`): free-text/`/monitor <IP|domain>` → upsert target ping 60s + opt-in Redis `bot:monitor:ids` + status key `bot:monitor:status:<target_id>`. Scheduler `_loop_network` (single ping authority) panggil `maybe_notify_monitor` tiap check → alert Telegram **hanya kalau bucket up↔down berubah** (first-seen = seed diam-diam tanpa bomber). Format `[DOWN] JARINGAN DOWN` / `[PULIH] JARINGAN KEMBALI` + latency/loss/alasan/resolve IP/WIB, personalisasi random. Target valid = IP publik ATAU privat (loopback/multicast/unspecified ditolak) ATAU domain. Stop: `/monitor stop <IP|domain>`, free-text "stop/batalkan monitoring X"; daftar `/monitor list`. Command handler `commands.py:start_monitoring/stop_monitoring/monitoring_list` di-share sama intercept free-text di `telegram.py:_reply_ai`. Redis TTL: status 30d (`NETWORK_MONITOR_STATE_TTL_SECONDS`), ids 365d (`NETWORK_MONITOR_IDS_TTL_SECONDS`); fallback in-memory kalau Redis None (aman di test).
+- **Jarvis memory** (`app/memory.py`, migration `b2c3d4e5f6a7_add_memories_table.py` — tabel `memories`: id/content/kind note|action|monitor|cron/source/meta/created_at): auto-catat action penting (monitor start/stop, scrape sukses) + perintah eksplisit free-text `inget/catat/hafal/simpen/simpan/remember/note <isi>` (jangan "ingetin X jam Y" — itu cron). Dedup exact-match 50 baris terakhir; prun terlama saat > `MEMORY_MAX_ITEMS` (default 200; floor 50). /memory list + `/forget <id>`.
+- **Web scrape tanpa perintah** (`app/webscrape.py`): free-text `scrape/fetch/ambil isi dari <url>` → fetch deterministik (title/desc/text/6 link, cap 512KB) via httpx + BeautifulSoup, di-render HTML-card escape, catat memory kind=action. **SSRF guard**: hanya host yang resolve ke IP publik; `localhost`/`192.168.*`/`10.*`/`172.16-31`/`169.254.*`/metadata ditolak (bot `network_mode host`).
+- **Grounding AI** (`app/interfaces/context.py`): tiap turn free-text → `build_situation_block(session)` (host quick-overview `hoststats.quick_overview()` — uptime/load/RAM/disk, tanpa sampling CPU; monitor aktif + status live; alert P1/P2 aktif; 5 berita teratas; cuaca watchlist; memori recall) di-inject ke system prompt + **conversation history** per chat di Redis `bot:chat:<chat_id>` (cap = `TELEGRAM_CHAT_CONTEXT_LIMIT`×2, TTL 7 hari). `_reply_ai` urutan intercept: **shell → monitor → memory → scrape → whois → cron → AI** (monitor & memory DI DEPAN whois biar short phrase ber-IP/URL gak ke-hijack jadi WHOIS).
+- **Persona di push** (F3): auto-news-push & morning digest sekarang dibuka kalimat persona random (`_PUSH_OPENERS`, `_DIGEST_GREETINGS`).
+- **Config baru** (`app/config.py`): `NETWORK_MONITOR_STATE_TTL_SECONDS` (2.592.000), `NETWORK_MONITOR_IDS_TTL_SECONDS` (31.536.000), `MEMORY_MAX_ITEMS` (200), `MEMORY_RECALL_LIMIT` (10), `WEB_SCRAPE_MAX_BYTES` (524.288), `WEB_SCRAPE_TEXT_CHARS` (1800), `WEB_SCRAPE_MAX_LINKS` (6). `.env.example` di-sync (tambah `AI_CHAT_MAX_TOKENS`, `CRON_POLL_INTERVAL_SECONDS`, `NEWS_SPORT_SOURCE_KEYWORDS`, `NETWORK_TARGET_FIXTURES` uncomment, blok Telegram bot).
+- **Perintah baru**: `/monitor`, `/monitor stop <IP|domain>`, `/monitor list`, `/memory`, `/forget <id>` (masuk `HELP`).
+- Tests: suite **296 passed**. Baru: `tests/test_monitoring.py` (deteksi intent start/stop, loopback rejected, is_monitor_target, fallback state, transition alert cuma pas flip, upsert re-enable, command list/lainnya), `tests/test_memory.py` (remember/recall/forget/dedup/kind whitelist/cap prune), `tests/test_webscrape.py` (extract_url, intent, SSRF reject private/loopback/metadata, parse_html pure, format escape), `tests/test_ai_smart.py` (history roundtrip/isolasi/clear/cap, situation block, quick_overview, memory detection).
 
 ### Phase 5 Multimodal & Documents (detail)
 
@@ -87,7 +99,7 @@ Monitoring bot dibangun phase-by-phase. Status di bawah ini TO-DATE saat terakhi
 - `pytest` TIDAK ada di image run-container. Setiap `docker-compose run` untuk test, chain-kan:
   `pip install -q pytest pytest-asyncio aiosqlite httpx openpyxl 2>/dev/null || true; python -m pytest tests -q`
 - Workdir run-container harus `/code` + bind mount proyek: `-v /home/deimonji/rahasia-negara/vibe-code/kela-ai:/code --workdir /code`.
-- Seluruh suite: **238 tests pass** (termasuk `tests/test_documents.py` 13 test + `tests/test_documents_repo.py` 5 test + `tests/test_vision.py` 6 test + `tests/test_interfaces.py` 58 test + `tests/test_host_utils.py` 23 test + `tests/test_prompts.py` 11 test + `tests/test_cron.py` 17 test + `tests/test_shell.py` 4 test + `tests/test_model_pool.py` 8 test + `tests/test_client_provider.py` 7 test + `test_alert_engine.py` news-skip + `chunk_html` 5 test).
+- Seluruh suite: **296 tests pass** (238 lama + `tests/test_monitoring.py` + `tests/test_memory.py` + `tests/test_webscrape.py` + `tests/test_ai_smart.py`, tabel `memories` masuk `tests/test_schema.py`).
 - Alembic: `alembic revision --autogenerate -m "..."` lalu `alembic upgrade head`, cek `alembic check` (harus bersih). Jalan via run-container dengan `DATABASE_URL` di-set.
 - Deploy: `docker-compose build api scheduler worker bot && docker-compose up -d --force-recreate`.
 
