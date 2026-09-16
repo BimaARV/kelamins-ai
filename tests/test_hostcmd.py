@@ -79,6 +79,14 @@ def test_detect_hostcmd_intents():
     assert detect_hostcmd_request("apa itu nginx?") is None
     assert detect_hostcmd_request("/sysinfo") is None
     assert detect_hostcmd_request("buatin config nginx buat gua") is None
+    assert detect_hostcmd_request("list user yang ada di host") == {
+        "kind": "cmd", "path": "", "content": "passwd",
+    }
+    assert detect_hostcmd_request("daftar user di host dong") == {
+        "kind": "cmd", "path": "", "content": "passwd",
+    }
+    assert detect_hostcmd_request("passwd") == {"kind": "cmd", "path": "", "content": "passwd"}
+    assert detect_hostcmd_request("kasih tau user yang ada") == {"kind": "cmd", "path": "", "content": "passwd"}
 
 
 def test_render_hostcmd_escapes_content():

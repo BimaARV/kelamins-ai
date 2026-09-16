@@ -96,7 +96,35 @@ def test_md_to_html_bold_and_code():
 def test_md_to_html_no_raw_injection():
     out = md_to_html("<script>alert(1)</script>")
     assert "<script>" not in out
-    assert "&lt;script&gt;" in out
+    assert "&lt;script&gt;" not in out
+
+
+def test_md_to_html_neutralize_html():
+    out = md_to_html('<b style="color: #00ff00;">GOOGLE</b>')
+    assert "<b>GOOGLE</b>" in out
+    assert "color" not in out
+    out = md_to_html('<span style="color: #ff0000;">red</span> dan <i>x</i>')
+    assert "red" in out and "color" not in out
+    assert "<i>x</i>" in out
+    out = md_to_html("<br>baris<br>baru")
+    assert "\n" in out
+    out = md_to_html("nya `<code>kode</code>`")
+    assert "<code>kode</code>" in out
+
+
+def test_md_to_html_neutralize_latex():
+    out = md_to_html("arah $\\rightarrow$ kanan")
+    assert "arah → kanan" in out
+    assert "$" not in out
+    out = md_to_html("kecepatan \\frac{1}{2}c")
+    assert "kecepatan 1/2c" in out
+    out = md_to_html("$x \\times y$ dan $a \\leq b$")
+    assert "x × y" in out and "a ≤ b" in out
+    out = md_to_html("alpha \\alpha gamma \\gamma")
+    assert "α" in out and "γ" in out
+    out = md_to_html("```\n$x$ \\rightarrow\n```")
+    assert "<pre>" in out and "$x$ \\rightarrow" in out
+    assert "→" not in out
 
 
 def test_md_to_html_plain_unchanged():

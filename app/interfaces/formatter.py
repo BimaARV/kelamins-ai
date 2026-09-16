@@ -49,18 +49,88 @@ def chunk_html(text: str, max_chars: int = 3950) -> list[str]:
     return chunks or [text]
 
 
+def _neutralize_html(text: str) -> str:
+    """Turn raw HTML tags (AI often writes <b>/<span style=...>) into plain
+    markdown so they render as real formatting instead of visible garbage."""
+    text = re.sub(r"(?i)</?(?:b|strong)\b[^>]*>", "**", text)
+    text = re.sub(r"(?i)</?(?:i|em)\b[^>]*>", "*", text)
+    text = re.sub(r"(?i)</?code\b[^>]*>", "`", text)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    return re.sub(r"</?[a-zA-Z][^>]*>", "", text)
+
+
+_LATEX_MAP = [
+    (r"\\rightarrow", "→"),
+    (r"\\to\b", "→"),
+    (r"\\Rightarrow", "→"),
+    (r"\\Longrightarrow", "→"),
+    (r"\\leftarrow", "←"),
+    (r"\\gets\b", "←"),
+    (r"\\Leftarrow", "←"),
+    (r"\\leftrightarrow", "↔"),
+    (r"\\cdot\b", "·"),
+    (r"\\times\b", "×"),
+    (r"\\leq\b", "≤"),
+    (r"\\le\b", "≤"),
+    (r"\\geq\b", "≥"),
+    (r"\\ge\b", "≥"),
+    (r"\\approx\b", "≈"),
+    (r"\\neq\b", "≠"),
+    (r"\\ne\b", "≠"),
+    (r"\\pm\b", "±"),
+    (r"\\infty\b", "∞"),
+    (r"\\alpha\b", "α"),
+    (r"\\beta\b", "β"),
+    (r"\\gamma\b", "γ"),
+    (r"\\delta\b", "δ"),
+    (r"\\theta\b", "θ"),
+    (r"\\lambda\b", "λ"),
+    (r"\\mu\b", "μ"),
+    (r"\\pi\b", "π"),
+    (r"\\omega\b", "ω"),
+    (r"\\sum\b", "Σ"),
+    (r"\\Delta\b", "Δ"),
+]
+
+
+def _neutralize_latex(text: str) -> str:
+    """Replace common LaTeX remnants (prompt forbids them; AI still slips)."""
+    for pattern, repl in _LATEX_MAP:
+        text = re.sub(pattern, repl, text)
+    text = re.sub(
+        r"\\(?:frac|dfrac|tfrac)\{([^{}]*)\}\{([^{}]*)\}", r"\1/\2", text
+    )
+    text = re.sub(
+        r"\\(?:sqrt)\{([^{}]*)\}", r"√(\1)", text
+    )
+    text = re.sub(r"\\(?:;| )", " ", text)
+    text = re.sub(r"\$([^$\n]+)\$", r"\1", text)
+    return text
+
+
 def md_to_html(text: str) -> str:
     """Convert a small markdown subset to Telegram HTML.
 
     Supports: headings (#), bold (**x**), italic (*x* / _x_), inline code
     (`x`), fenced code blocks (```...```), bullet lists (- / * / +), and
-    hard line breaks. Input is escaped first so AI text can't inject raw
-    HTML tags.
+    hard line breaks. Raw HTML tags written by the AI (``<b>``, ``<span
+    style=...>``, …) and stray LaTeX (``$\rightarrow$``) are neutralised first
+    so they read as formatting instead of visible garbage; any remaining raw
+    tags are escaped so AI text can't inject HTML.
     """
-    out = html.escape(str(text), quote=False)
+    out = str(text)
+    pre = []
     out = re.sub(
-        r"```[a-zA-Z]*\n(.*?)```", lambda m: f"<pre>{m.group(1)}</pre>", out, flags=re.S
+        r"```[a-zA-Z]*\n(.*?)```",
+        lambda m: pre.append(m.group(1)) or f"\x00PRE{len(pre)-1}\x00",
+        out,
+        flags=re.S,
     )
+    out = _neutralize_html(out)
+    out = _neutralize_latex(out)
+    out = html.escape(out, quote=False)
+    for i, body in enumerate(pre):
+        out = out.replace(f"\x00PRE{i}\x00", f"<pre>{html.escape(body, quote=False)}</pre>")
     out = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", out)
     out = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", out)
     out = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", out)

@@ -121,6 +121,7 @@ COMMAND_ARGV = {
     "ps": ["ps", "aux"],
     "ss": ["ss", "-tulpn"],
     "top": ["top", "-b", "-n", "1"],
+    "passwd": ["cat", "/host-root/etc/passwd"],
 }
 
 
@@ -155,6 +156,12 @@ _CMD_RE = re.compile(
     r"^(?:jalanin|jalankan|run|tampilin|tampilkan|output|keluarin|cek)?\s*(%s)\s*$" % "|".join(_CMD_NAMES),
     re.I,
 )
+_USER_RE = re.compile(
+    r"\b(?:list|daftar|kasih|tunjukin|tampilin|lihat|siapa)\s+"
+    r"(?:user|pengguna|akun|user-user|list-user|user-list)"
+    r"|list\s+user\b|daftar\s+user\b|user\s+yang\s+ada\b|user\s+di\s+host\b|passwd\b",
+    re.I,
+)
 
 
 def detect_hostcmd_request(text: str) -> dict | None:
@@ -185,6 +192,8 @@ def detect_hostcmd_request(text: str) -> dict | None:
     m = _CMD_RE.match(low)
     if m:
         return {"kind": "cmd", "path": "", "content": (m.group(1) or "").lower()}
+    if _USER_RE.search(low):
+        return {"kind": "cmd", "path": "", "content": "passwd"}
     return None
 
 
