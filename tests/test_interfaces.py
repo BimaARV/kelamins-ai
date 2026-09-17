@@ -327,22 +327,45 @@ async def test_gempa_min_magnitude_filter(session):
 @pytest.mark.asyncio
 async def test_network_empty(session):
     from app.interfaces.commands import dispatch
+    from app.monitoring import _MEM_FALLBACK
+    _MEM_FALLBACK["ids"] = set()
     out = await dispatch("/network", session)
-    assert "tidak ada" in out.lower() or "Network" in out
+    assert "Monitor" in out and "belum ada" in out
 
 
 @pytest.mark.asyncio
 async def test_network_with_targets(session):
     from app.interfaces.commands import dispatch
+    from app.monitoring import _MEM_FALLBACK, set_monitored
+    _MEM_FALLBACK["ids"] = set()
     tgt = NetworkTarget(name="Google DNS", target_type="dns", target="8.8.8.8")
     session.add(tgt)
     await session.flush()
     check = NetworkCheck(target_id=tgt.id, status="up", latency_ms=12.5)
     session.add(check)
+    await session.flush()
+    await set_monitored(tgt.id)
     await session.commit()
     out = await dispatch("/network", session)
     assert "Google DNS" in out
     assert "up" in out
+
+
+@pytest.mark.asyncio
+async def test_network_stopped_target_hidden(session):
+    """/network == active /monitor list: stopped targets must NOT show up."""
+    from app.interfaces.commands import dispatch
+    from app.monitoring import _MEM_FALLBACK
+    _MEM_FALLBACK["ids"] = set()
+    tgt = NetworkTarget(name="RIP", target_type="dns", target="1.1.1.1", enabled=False)
+    session.add(tgt)
+    await session.flush()
+    check = NetworkCheck(target_id=tgt.id, status="down", latency_ms=None)
+    session.add(check)
+    await session.commit()
+    out = await dispatch("/network", session)
+    assert "RIP" not in out
+    assert "belum ada" in out
 
 
 @pytest.mark.asyncio
@@ -508,6 +531,15 @@ def test_detect_whois_request_not_hijack_monitor():
     assert _detect_whois_request("cekin 8.8.8.8 terus") is None
     assert _detect_whois_request("pantau 8.8.8.8 terus") is None
     assert _detect_whois_request("tolong cekin ip 103.153.42.237") is None
+
+
+def test_detect_whois_request_not_hijack_diag():
+    from app.interfaces.telegram import _detect_whois_request
+    assert _detect_whois_request("cek rute ke 8.8.8.8") is None
+    assert _detect_whois_request("ping 8.8.8.8") is None
+    assert _detect_whois_request("cek asn 8.8.8.8") is None
+    assert _detect_whois_request("geo-trace google.com") is None
+    assert _detect_whois_request("whois 8.8.8.8") == "8.8.8.8"
 
 
 @pytest.mark.asyncio

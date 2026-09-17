@@ -247,6 +247,15 @@ async def disable_monitor_target(session, target: NetworkTarget) -> None:
     await session.commit()
 
 
+async def _remember_monitor(session, row, text: str) -> None:
+    """Best-effort memory write for monitor name changes."""
+    try:
+        from app.memory import remember
+        await remember(session, text, kind="monitor", source="chat", meta={"target_id": row.id})
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def update_monitor_target(
     session,
     target: str,
@@ -266,6 +275,7 @@ async def update_monitor_target(
     if name is not None:
         row.name = name.strip() or row.name
         changed.append(f"nama → {row.name}")
+        await _remember_monitor(session, row, f"monitor {target} dinamai {row.name}")
     if interval is not None:
         if not 10 <= int(interval) <= 3600:
             return None, "Interval harus 10–3600 detik."
@@ -289,6 +299,7 @@ async def set_monitor_name(session, target: str, name: str) -> NetworkTarget | N
         return None
     row.name = name.strip() or row.name
     await session.commit()
+    await _remember_monitor(session, row, f"monitor {target} dinamai {row.name}")
     return row
 
 
@@ -492,7 +503,7 @@ _PERSONA_DOWN = [
 _PERSONA_UP = [
     "Update bagus dari monitoring:",
     "Eh, targetnya balik lagi nih:",
-    "KELA lapor: udah pulih nih:",
+    "KELA lapor: udah balik UP nih:",
 ]
 
 
@@ -521,7 +532,7 @@ async def maybe_notify_monitor(target: NetworkTarget, result: dict, chat_id: str
         return False
 
     if bucket == "up":
-        body = await format_monitor_pulih(target, result)
+        body = await format_monitor_up(target, result)
     else:
         body = await format_monitor_down(target, result)
     return await send_monitor_alert(body, chat_id=chat_id)
@@ -545,11 +556,10 @@ async def _detail_lines(target: NetworkTarget, result: dict) -> list[str]:
     loss = result.get("packet_loss")
     if latency is not None:
         lines.append(f"  Latency: {float(latency):.0f} ms")
+    else:
+        lines.append("  Latency: —")
     if loss is not None:
         lines.append(f"  Loss: {esc(f'{loss:g}')}%")
-    err = result.get("error_message")
-    if err:
-        lines.append(f"  Alasan: {esc(str(err)[:200])}")
     ip = await _resolve_ip(target.target)
     if ip and ip != target.target:
         lines.append(f"  Resolve: {mono(ip)}")
@@ -565,10 +575,10 @@ async def format_monitor_down(target: NetworkTarget, result: dict) -> str:
     return "\n".join(lines)
 
 
-async def format_monitor_pulih(target: NetworkTarget, result: dict) -> str:
+async def format_monitor_up(target: NetworkTarget, result: dict) -> str:
     opener = random.choice(_PERSONA_UP)
     name = target.name or target.target
-    lines = [f"{opener}", f"{bold('[PULIH] JARINGAN KEMBALI')} — {bold(esc(name))}"]
+    lines = [f"{opener}", f"{bold('[UP] JARINGAN KEMBALI')} — {bold(esc(name))}"]
     lines.extend(await _detail_lines(target, result))
     return "\n".join(lines)
 

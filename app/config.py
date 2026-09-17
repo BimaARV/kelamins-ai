@@ -145,10 +145,19 @@ class Settings(BaseSettings):
         default=900, alias="MONITOR_NAME_PROMPT_TTL_SECONDS"  # 15 menit
     )
 
-    # Host executor (Phase 6.6 - root + allowlist): file ops + benign commands
-    # through the bot container on the real host root (bind /host-root:rw).
+    # Host executor (Phase 6.6 - root on host): file ops + exact-argv command
+    # map + arbitrary chroot'd host shell, via the bot container bind /host-root:rw.
     hostcmd_allowed_roots: str = Field(
         default='["/home", "/tmp", "/var/log"]', alias="HOSTCMD_ALLOWED_ROOTS"
+    )
+    hostcmd_enable_shell: bool = Field(
+        default=True, alias="HOSTCMD_ENABLE_SHELL"
+    )
+    hostcmd_blocked_re: str = Field(
+        default="", alias="HOSTCMD_BLOCKED_RE"
+    )
+    hostcmd_output_max_chars: int = Field(
+        default=3500, alias="HOSTCMD_OUTPUT_MAX_CHARS"
     )
 
     # Jarvis memory (persistent, golden recorded actions + explicit notes)

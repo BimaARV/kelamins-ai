@@ -31,7 +31,7 @@ from app.db.models import (
     WeatherForecast,
     WeatherLocation,
 )
-from app.memory import build_memory_section, recall
+from app.memory import build_memory_section, recall, recall_kind
 from app.monitoring import list_monitored_ids
 
 CHAT_KEY = "bot:chat:{}"
@@ -202,7 +202,8 @@ async def build_situation_block(session: AsyncSession) -> str:
                 c = by_tid.get(t.id)
                 st = getattr(c.status, "value", c.status) if c else "belum dicek"
                 lat = f" ({c.latency_ms:.0f} ms)" if c and c.latency_ms is not None else ""
-                lines.append(f"  monitor {t.target}: {st}{lat}")
+                name = t.name if t.name and t.name != t.target else t.target
+                lines.append(f"  monitor {name} ({t.target}): {st}{lat}")
     except Exception:  # noqa: BLE001
         logger.debug("monitor block skipped", exc_info=True)
 
@@ -247,3 +248,10 @@ async def build_situation_block(session: AsyncSession) -> str:
     if not lines:
         return ""
     return "\n".join(lines)
+
+
+async def build_memory_section_from(
+    session: AsyncSession, kind: str, limit: int | None = None
+) -> str:
+    """Kind-scoped memory block (e.g. ``monitor``) for the AI system prompt."""
+    return build_memory_section(await recall_kind(session, kind, limit=limit), limit=limit or 10)

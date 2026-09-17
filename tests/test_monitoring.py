@@ -151,6 +151,31 @@ async def test_status_roundtrip_fallback():
     assert await get_monitor_status(7) is None
 
 
+async def test_down_detail_uses_latency_not_alasan():
+    from app.monitoring import _detail_lines
+
+    t = _t()
+    lines = await _detail_lines(
+        t,
+        {
+            "status": "down",
+            "latency_ms": None,
+            "packet_loss": 100.0,
+            "error_message": "PING 8.8.8.8 (8.8.8.8) 56 bytes ... 4 packets transmitted, 4 received ...",
+        },
+    )
+    text = "\n".join(lines)
+    assert "Latency: —" in text
+    assert "Alasan" not in text
+    assert "<code>down</code>" in text
+    assert "Loss: 100%" in text
+
+    lines2 = await _detail_lines(t, {"status": "up", "latency_ms": 12.3, "packet_loss": 0.0})
+    text2 = "\n".join(lines2)
+    assert "Latency: 12 ms" in text2
+    assert "Loss: 0%" in text2
+
+
 # ---------------------------------------------------------------------------
 # Transition detection: alerts fire only on a real up<->down flip
 # ---------------------------------------------------------------------------
@@ -218,7 +243,7 @@ async def test_alert_fires_on_up_flip(monkeypatch):
     ok = await maybe_notify_monitor(_t(), {"status": "up", "latency_ms": 12.3})
     assert ok is True
     assert len(sent) == 1
-    assert "[PULIH]" in sent[0]
+    assert "[UP]" in sent[0]
 
 
 async def test_no_alert_for_unmonitored_target(monkeypatch):
@@ -330,3 +355,69 @@ async def test_set_monitor_name_and_pending_roundtrip():
     assert await get_monitor_name_pending("c1") == "8.8.8.8"
     await clear_monitor_name_pending("c1")
     assert await get_monitor_name_pending("c1") is None
+
+
+# ---------------------------------------------------------------------------
+# Start-monitoring DOWN alert bug (Phase 6.6): starting on a down target must
+# NOT absorb "down" into the silent first-seen seed — a DOWN alert goes out.
+# ---------------------------------------------------------------------------
+
+
+async def test_start_monitoring_alerts_when_first_check_down(
+    session, monkeypatch
+):
+    from app.interfaces.commands import start_monitoring
+
+    sent = []
+
+    async def fake_check(row):
+        return {"status": "down", "latency_ms": None, "error_message": "timeout"}
+
+    async def fake_store(s, tid, result):
+        pass
+
+    async def fake_send(body, chat_id=None):
+        sent.append(body)
+        return True
+
+    async def fake_format_down(target, result):
+        return "[DOWN] JARINGAN DOWN — test"
+
+    monkeypatch.setattr(
+        "app.collectors.network.checks.run_check", fake_check
+    )
+    monkeypatch.setattr("app.db.repo.store_network_check", fake_store)
+    monkeypatch.setattr("app.monitoring.send_monitor_alert", fake_send)
+    monkeypatch.setattr("app.monitoring.format_monitor_down", fake_format_down)
+
+    reply = await start_monitoring(session, "1.1.1.1", chat_id="c1")
+    assert "Monitor aktif" in reply
+    assert len(sent) == 1
+    assert "[DOWN] JARINGAN DOWN" in sent[0]
+
+
+async def test_start_monitoring_silent_when_first_check_up(
+    session, monkeypatch
+):
+    from app.interfaces.commands import start_monitoring
+
+    sent = []
+
+    async def fake_check(row):
+        return {"status": "up", "latency_ms": 4.2, "error_message": None}
+
+    async def fake_store(s, tid, result):
+        pass
+
+    async def fake_send(body, chat_id=None):
+        sent.append(body)
+        return True
+
+    monkeypatch.setattr(
+        "app.collectors.network.checks.run_check", fake_check
+    )
+    monkeypatch.setattr("app.db.repo.store_network_check", fake_store)
+    monkeypatch.setattr("app.monitoring.send_monitor_alert", fake_send)
+
+    await start_monitoring(session, "8.8.8.8", chat_id="c1")
+    assert sent == []

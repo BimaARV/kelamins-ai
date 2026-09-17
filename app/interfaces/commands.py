@@ -53,7 +53,7 @@ HELP = (
     f"  /sport-f1 {esc('Detail: berita Formula 1')}\n"
     f"  /gempa      {esc('Gempa terakhir (max 5)')}\n"
     f"  /gempa 5    {esc('Gempa M ≥ X (contoh: /gempa 4)')}\n"
-    f"  /network    {esc('Status jaringan terkini')}\n"
+    f"  /network    {esc('Daftar monitor aktif + status (sama kayak /monitor list)')}\n"
     f"  /weather    {esc('Cuaca BMKG (opsional: filter lokasi)')}\n"
     f"  /whois      {esc('Info pemilik IP/domain via RDAP (contoh: /whois 8.8.8.8, /whois cnnindonesia.com)')}\n"
     f"  /asn        {esc('Info ASN/ISP/geo sebuah IP (contoh: /asn 8.8.8.8)')}\n"
@@ -64,7 +64,7 @@ HELP = (
     f"  /sysinfo    {esc('Metrik host: CPU/RAM/disk/network/uptime')}\n"
     f"  /status     {esc('Ringkasan sistem (host + DB)')}\n"
     f"  /status ai  {esc('Status AI gateway')}\n"
-    f"  /monitor   {esc('Mulai pantau target + auto-alert DOWN/PULIH (contoh: /monitor 8.8.8.8)')}\n"
+    f"  /monitor   {esc('Mulai pantau target + auto-alert DOWN/UP (contoh: /monitor 8.8.8.8)')}\n"
     f"  /monitor stop {esc('<IP|domain> — berhenti pantau')}\n"
     f"  /monitor list {esc('Daftar target yang dipantau')}\n"
     f"  /memory    {esc('Catatan memori yang gua simpan')}\n"
@@ -438,37 +438,7 @@ async def _whois(session: AsyncSession, arg: str) -> str:  # noqa: ARG001
 
 
 async def _network(session: AsyncSession, arg: str) -> str:  # noqa: ARG001
-    subq = (
-        select(NetworkCheck.target_id, func.max(NetworkCheck.id).label("max_id"))
-        .group_by(NetworkCheck.target_id)
-        .subquery()
-    )
-    latest = (
-        await session.execute(
-            select(NetworkCheck).join(subq, NetworkCheck.id == subq.c.max_id).order_by(NetworkCheck.target_id)
-        )
-    ).scalars().all()
-    targets = (
-        await session.execute(select(NetworkTarget).order_by(NetworkTarget.id))
-    ).scalars().all()
-    if not targets:
-        return f"{bold('Network')} — tidak ada target."
-    by_tid = {c.target_id: c for c in latest}
-    lines = [bold("Status jaringan")]
-    up_count = down_count = 0
-    for t in targets:
-        c = by_tid.get(t.id)
-        st = getattr(c.status, "value", c.status) if c else " belum dicek"
-        up_count += 1 if st == "up" else 0
-        down_count += 1 if st in ("down", "timeout", "error") else 0
-        latency = f" — {num(c.latency_ms, 0)} ms" if c and c.latency_ms is not None else ""
-        lines.append(
-            f"\n{bold(esc(t.name))} [{esc(getattr(t.target_type, 'value', t.target_type))}]"
-            f" {mono(st)}{latency}"
-        )
-    if up_count or down_count:
-        lines.append(f"\nRingkasan: {up_count} up · {down_count} down · {len(targets) - up_count - down_count} lainnya")
-    return "\n".join(lines)
+    return await monitoring_list(session)
 
 
 async def _status(session: AsyncSession, arg: str) -> str:
@@ -688,6 +658,10 @@ async def start_monitoring(session: AsyncSession, text: str, chat_id: str | None
     raw = getattr(result["status"], "value", result["status"])
     status = str(raw).lower()
     await set_monitor_status(row.id, status)
+    if status != "up":
+        from app.monitoring import format_monitor_down, send_monitor_alert
+        body = await format_monitor_down(row, result)
+        await send_monitor_alert(body, chat_id=chat_id)
     await remember(
         session,
         f"monitor {target} (status {status})" + (f" nama {label}" if label else ""),
@@ -698,7 +672,7 @@ async def start_monitoring(session: AsyncSession, text: str, chat_id: str | None
     display = label or target
     lines = [
         f"{bold('Monitor aktif')} — {bold(esc(display))} {mono(f'({esc(target)})')} dicek tiap {mono('60')} detik.",
-        "Alert DOWN/PULIH bakal dikirim otomatis.",
+        "Alert DOWN/UP bakal dikirim otomatis.",
         "",
         f"Cek pertama: {_monitor_check_line(result)}",
     ]

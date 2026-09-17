@@ -16,6 +16,17 @@ def _compile_bigint_sqlite(type_, compiler, **kw):
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_live_redis(monkeypatch):
+    """Force the in-memory monitoring fallback so tests are hermetic.
+
+    The dev machine has live Redis + populated ``bot:monitor:ids``; without this,
+    `/network` and monitor-state helpers read production ids and leak state
+    across tests.
+    """
+    monkeypatch.setattr("app.monitoring._redis", lambda: None)
+
+
 @pytest.fixture
 def sample_rss_bytes() -> bytes:
     return b"""<?xml version="1.0" encoding="UTF-8"?>

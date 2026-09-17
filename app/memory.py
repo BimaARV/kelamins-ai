@@ -79,6 +79,19 @@ async def recall(session: AsyncSession, limit: int | None = None) -> list[Memory
     return list(result.scalars().all())
 
 
+async def recall_kind(session: AsyncSession, kind: str, limit: int | None = None) -> list[Memory]:
+    """Recall the most recent memories of one kind (e.g. ``monitor``)."""
+    limit = limit or int(settings.memory_recall_limit or 10)
+    limit = max(limit, 1)
+    result = await session.execute(
+        select(Memory)
+        .where(Memory.kind == kind)
+        .order_by(Memory.id.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
 async def forget(session: AsyncSession, memory_id: int) -> bool:
     row = (
         await session.execute(select(Memory).where(Memory.id == memory_id))

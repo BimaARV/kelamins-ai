@@ -26,6 +26,7 @@ import httpx
 
 from app.config import settings
 from app.interfaces.formatter import bold, chunk_html, esc, md_to_html, mono
+from app.interfaces.netdiag import detect_diag_request
 from app.monitoring import detect_monitor_start, detect_monitor_stop
 from app.shell import format_server_command, parse_server_request, run_network_cmd
 from app.webscrape import detect_scrape_request, format_scrape, scrape_url
@@ -183,7 +184,7 @@ async def _dispatch_text(text: str, chat_id: str, message_id: int) -> None:
 
 
 async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
-    """Route free-text in order: pending-name → monitor-edit → shell → hostcmd → monitor → memory → scrape → whois → cron → sysinfo → AI."""
+    """Route free-text in order: pending-name → monitor-edit → shell → diag → hostcmd → monitor → memory → scrape → whois → cron → sysinfo → AI."""
     from app.monitoring import (
         clear_monitor_name_pending,
         detect_monitor_edit,
@@ -244,13 +245,45 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
         await _handle_server_cmd(shell_args, chat_id, message_id)
         return
 
+    # Deterministic network diagnostics for free text (traceroute/ping/asn/
+    # geo-trace/ipinfo). Runs the real tool; when the user asks to interpret,
+    # hands the real output to the AI below instead of returning the card.
+    diag = detect_diag_request(text)
+    if diag is None:
+        # Target may be a MONITOR NAME (e.g. "trace ke BIOS" == RO-BIOS).
+        from app.db.repo import list_enabled_targets
+        from app.db.session import session_factory
+        from app.interfaces.netdiag import detect_mention_diag
+
+        try:
+            async with session_factory() as session:
+                targets = await list_enabled_targets(session)
+        except Exception:
+            targets = []
+        monitors = {t.name.lower(): t.target for t in targets if t.name}
+        diag = detect_mention_diag(text, monitors)
+    diag_ground = None
+    if diag is not None:
+        from app.interfaces.netdiag import run_diag
+
+        diag_out = await run_diag(diag["kind"], diag.get("target"))
+        if _DIAG_INTERPRET_RE.search(text):
+            diag_ground = diag_out
+        else:
+            await send_message(chat_id, diag_out, reply_to=message_id)
+            return
+
     from app.hostcmd import (
         detect_hostcmd_request,
+        host_delete_path,
         host_list_dir,
+        host_mkdir,
         host_read_file,
+        host_rmdir,
         host_write_file,
         render_hostcmd_result,
         run_host_command,
+        run_host_shell,
     )
 
     hc_req = detect_hostcmd_request(text)
@@ -262,8 +295,16 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
             raw = host_write_file(hc_req["path"], hc_req.get("content", ""))
         elif kind == "dir":
             raw = host_list_dir(hc_req["path"])
+        elif kind == "delete":
+            raw = host_delete_path(hc_req["path"])
+        elif kind == "mkdir":
+            raw = host_mkdir(hc_req["path"])
+        elif kind == "rmdir":
+            raw = host_rmdir(hc_req["path"])
         elif kind == "cmd":
             raw = run_host_command(hc_req["content"])
+        elif kind == "shell":
+            raw = run_host_shell(hc_req["content"])
         else:
             raw = "Unknown host request."
         await send_message(chat_id, render_hostcmd_result(hc_req, raw), reply_to=message_id)
@@ -368,12 +409,41 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
         f"{counts.get('articles',0)} articles, "
         f"{counts.get('earthquakes',0)} gempa, "
         f"{counts.get('alerts',0)} alerts.\n"
-        f"Lo punya akses host: baca file (/home, /tmp, /var/log), jalanin command "
-        f"lscpu/df/free/uptime/uname/id/whoami/ps/ss/top/passwd (list user). "
-        f"Kalau user minta hal itu, jangan nolak ngaku 'nggak punya akses'."
+        f"Lo punya akses host NYATA: baca/tulis/list/hapus file & folder di /home, /tmp, "
+        f"/var/log, bikin folder (mkdir), jalanin command lscpu/df/free/uptime/uname/"
+        f"id/whoami/ps/ss/top/passwd (list user), shell host arbitrer (perintah shell "
+        f"apa aja — ls, cat, git, docker, dll; yang destruktif kayak reboot/mkfs/dd/"
+        f"rm -rf / udah diblokir otomatis), DAN network diag: traceroute/ping/asn/"
+        f"geo-trace/ipinfo. Semua itu DIJALANKAN BENERAN di host pas user minta — "
+        f"hasilnya dikasih ke lo di blok HASIL PERINTAH NYATA. Kalau data teknis "
+        f"(angka, hop, latency, isi file, status service) nggak ada di KONDISI "
+        f"SEKARANG / HASIL PERINTAH NYATA, JANGAN ngarang — bilang datanya belum di "
+        f"tangan lo dan saranin jalankan perintahnya (atau ketik /traceroute dll). "
+        f"Kalau user nyebut NAMA monitoring (RO-BIOS, RO-UNIV, dll) minta trace/ping, "
+        f"itu bakal di-resolve ke IP-nya dan dijalanin BENERAN — lo gak perlu nebak "
+        f"hop-nya. Pengingat: hop/latency/angka cuma boleh dari blok HASIL PERINTAH "
+        f"NYATA, dan jawaban lo jangan nambahin data yang gak ada di situ."
     )
     if situation:
         system += f"\n\nKONDISI SEKARANG (pakai fakta ini, jangan ngarang):\n{situation}"
+    if diag_ground:
+        system += (
+            "\n\nHASIL PERINTAH NYATA (barusan lo jalanin beneran di host — pakai ini, "
+            "JANGAN ngarang angka/hop/latency; kasih bacaan/analisa, bukan hasil mentah "
+            "ulang):\n"
+            f"{diag_ground}"
+        )
+    import re as _re
+
+    if _re.search(r"\b(monitor|pantau|network|siapa|namanya|nama.*monitor|ganti.*nama)\b", text, _re.I):
+        async with session_factory() as session:
+            from app.interfaces.context import build_memory_section_from
+            mon_mems = await build_memory_section_from(session, kind="monitor")
+        if mon_mems:
+            system += (
+                f"\n\nRIWAYAT MONITOR (nama target yang pernah lo kasih/ubah — "
+                f"pakai buat nyebut nama yang bener):\n{mon_mems}"
+            )
     if briefing:
         system += (
             f"\n\nARTIKEL DARI MONITORING (72 jam terakhir — sumber buat klaim berita, "
@@ -525,6 +595,18 @@ _WHOIS_MONITOR_WORD_RE = re.compile(
     r"|amatin|intip|watch|always\s*on)\b",
     re.IGNORECASE,
 )
+_WHOIS_DIAG_WORD_RE = re.compile(
+    r"\b(traceroute[\w-]*|trace-?route\w*|trace\w*|route\w*|rute\w*|ping(?:-in|-ing)?\b"
+    r"|asn\b|autonomous\b|geo-?trace\w*|ip-?info\b|ifconfig\b)",
+    re.IGNORECASE,
+)
+
+_DIAG_INTERPRET_RE = re.compile(
+    r"\b(jelasin|jelaskan|analisa|analisis|kenapa|gimana|bagaimana|berapa|ringkas|"
+    r"rangkum|rangkuman|interpre\w*|artiin|artikan|arti|banding\w*|evalua\w*|"
+    r"maksud|ngerti|bacain|habis)\b",
+    re.IGNORECASE,
+)
 
 
 def _detect_whois_request(text: str) -> str | None:
@@ -536,7 +618,7 @@ def _detect_whois_request(text: str) -> str | None:
         return None
     if "whois" in low or low == target:
         return target
-    if _WHOIS_MONITOR_WORD_RE.search(low):
+    if _WHOIS_MONITOR_WORD_RE.search(low) or _WHOIS_DIAG_WORD_RE.search(low):
         return None
     tokens = low.split()
     if (

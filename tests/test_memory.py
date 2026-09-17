@@ -103,3 +103,16 @@ def test_format_memory_list_cards(session):
     assert "#5" in out
     assert "/forget" in out
     assert "x" in out
+
+
+async def test_recall_kind_filters(session):
+    from app.memory import recall_kind
+
+    await remember(session, "monitor 8.8.8.8 dinamai DNS GOOGLE", kind="monitor")
+    await remember(session, "inget mau bikin resume", kind="note")
+    mons = await recall_kind(session, "monitor")
+    assert len(mons) == 1
+    assert "DNS GOOGLE" in mons[0].content
+    notes = await recall_kind(session, "note")
+    assert len(notes) == 1
+    assert notes[0].content == "inget mau bikin resume"
