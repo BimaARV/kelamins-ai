@@ -373,7 +373,7 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
             (Alert, "alerts"),
         ]:
             counts[label] = (await session.execute(select(func.count(model.id)))).scalar() or 0
-        situation = await build_situation_block(session)
+        situation = await build_situation_block(session, query=text)
         briefing = await build_news_briefing(session)
 
     gw = build_gateway(settings)
@@ -385,6 +385,25 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
             reply_to=message_id,
         )
         return
+
+    # Auto-learn user preferences from self-describing chatter ("gua suka X",
+    # "gua tinggal di Y") — recorded silently, re-injected every turn.
+    pref_block = ""
+    try:
+        from app.memory import build_memory_section, detect_preferences, recall_kind, remember
+
+        async with session_factory() as session:
+            for pref in detect_preferences(text):
+                await remember(session, pref, kind="preference", source="chat")
+            pref_rows = await recall_kind(
+                session, "preference", limit=max(int(settings.memory_pref_limit or 5), 1)
+            )
+            pref_block = build_memory_section(
+                pref_rows,
+                header="PREFERENSI USER (fakta personalisasi — pakai buat gaya/konteks, kutip, jangan ngarang):",
+            )
+    except Exception:
+        logger.debug("preference block skipped", exc_info=True)
 
     now = datetime.now(ZoneInfo("Asia/Jakarta"))
     system = (
@@ -422,10 +441,16 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
         f"Kalau user nyebut NAMA monitoring (RO-BIOS, RO-UNIV, dll) minta trace/ping, "
         f"itu bakal di-resolve ke IP-nya dan dijalanin BENERAN — lo gak perlu nebak "
         f"hop-nya. Pengingat: hop/latency/angka cuma boleh dari blok HASIL PERINTAH "
-        f"NYATA, dan jawaban lo jangan nambahin data yang gak ada di situ."
+        f"NYATA, dan jawaban lo jangan nambahin data yang gak ada di situ. "
+        f"Lo PUNYA memori: blok MEMORI RELEVAN & PREFERENSI USER itu fakta soal user "
+        f"(hobi, lokasi, aset/server, gaya) — pakai buat personalisasi, kutip aja, "
+        f"jangan ngarang. Kalau ada blok RINGKASAN OBROLAN SEBELUMNYA, itu inti "
+        f"thread lama — lanjutin konteksnya, jangan jawab kayak lo lupa semua."
     )
     if situation:
         system += f"\n\nKONDISI SEKARANG (pakai fakta ini, jangan ngarang):\n{situation}"
+    if pref_block:
+        system += f"\n\n{pref_block}"
     if diag_ground:
         system += (
             "\n\nHASIL PERINTAH NYATA (barusan lo jalanin beneran di host — pakai ini, "
@@ -449,6 +474,13 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
             f"\n\nARTIKEL DARI MONITORING (72 jam terakhir — sumber buat klaim berita, "
             f"sebut nama feed-nya):\n{briefing}"
         )
+    # Long-term thread: inject the rolling summary (if any) as a system block
+    # above the rolling history so the model keeps context across overflow.
+    from app.interfaces.context import build_summary_block, get_summary
+
+    summary_block = build_summary_block(await get_summary(chat_id))
+    if summary_block:
+        system += f"\n\n{summary_block}"
     history = await get_history(chat_id)
     messages = [
         {"role": "system", "content": system},
@@ -458,11 +490,25 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
     try:
         result = await gw.complete(messages, max_tokens=settings.ai_chat_max_tokens)
         content = result.content or ""
+        # Blank output happens - give the model one cooler shot before giving up.
+        if not content.strip():
+            result = await gw.complete(
+                messages, max_tokens=settings.ai_chat_max_tokens, temperature=0.3
+            )
+            content = result.content or ""
+        if not content.strip():
+            await send_message(
+                chat_id,
+                "AI jawabannya kosong, bro. Coba ulangi pertanyaan lo yang lebih spesifik ya.",
+                reply_to=message_id,
+            )
+            return
         parts = list(chunk_html(md_to_html(content)))
         for i, part in enumerate(parts):
             await send_message(chat_id, part, reply_to=message_id if i == 0 else None)
         if parts:
             await push_history(chat_id, text, " ".join(parts))
+            await _maybe_summarize(chat_id)
         await _maybe_send_file(text, content, chat_id)
     except AIUnavailable as exc:
         await send_message(
@@ -958,6 +1004,60 @@ async def _safe_handle(text: str, chat_id: str, msg_id: int) -> None:
         await _dispatch_text(text, chat_id, msg_id)
     except Exception:
         logger.exception("Unhandled error processing message: %s", text[:100])
+
+
+# ---------------------------------------------------------------------------
+# Long-term conversation memory (rolling >cap summary, best effort)
+# ---------------------------------------------------------------------------
+
+_summarizing: set[str] = set()
+_SUMMARY_TRIGGER_GAP = 2
+
+
+async def _maybe_summarize(chat_id: str) -> None:
+    """Fire-and-forget: once the rolling history is near its cap, condense it
+    into a short 'RINGKASAN OBROLAN SEBELUMNYA' block via the AI gateway so the
+    thread survives overflow. Never blocks the current reply and never crashes
+    the poll loop (all failures are swallowed)."""
+    if not settings.ai_chat_summary:
+        return
+    if chat_id in _summarizing:
+        return
+    cap = max(int(settings.telegram_chat_context_limit or 8), 1) * 2
+    rows = await get_history(chat_id)
+    if len(rows) < cap - _SUMMARY_TRIGGER_GAP:
+        return
+    from app.interfaces.context import set_summary
+    from app.kela_ai.gateway import build_gateway
+
+    gw = build_gateway(settings)
+    if not gw.configured:
+        return
+    _summarizing.add(chat_id)
+    try:
+        transcript = "\n".join(
+            f"{r['role']}: {r['content'][:400]}" for r in rows
+        )
+        prompt = (
+            "Ringkas obrolan ini jadi 3-5 poin inti yang WAJIB diingat "
+            "(fakta soal user, task yang lagi dikerjain, keputusan, aset/IP/server "
+            "yang disebut). Bahasa Indonesia ringkas per poin, tanpa emoji, tanpa HTML."
+        )
+        result = await gw.complete(
+            [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": transcript},
+            ],
+            max_tokens=600,
+        )
+        text = (result.content or "").strip()
+        if text:
+            await set_summary(chat_id, text)
+            logger.info("chat summary refreshed for %s", chat_id)
+    except Exception:
+        logger.debug("chat summary skip", exc_info=True)
+    finally:
+        _summarizing.discard(chat_id)
 
 
 # ---------------------------------------------------------------------------

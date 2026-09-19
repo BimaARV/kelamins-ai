@@ -246,6 +246,11 @@ async def store_raw_articles(session: AsyncSession, items: list[dict]) -> int:
         if existing:
             continue
         pub = item.get("published_at")
+        # Feed parsers may hand us timezone-aware datetimes while the DB and
+        # cutoff are naive-UTC — normalize before comparing so feeds never
+        # crash with "can't compare offset-naive and offset-aware datetimes".
+        if pub is not None and getattr(pub, "tzinfo", None) is not None:
+            pub = pub.replace(tzinfo=None)
         if cutoff is not None and pub is not None and pub < cutoff:
             skipped += 1
             continue

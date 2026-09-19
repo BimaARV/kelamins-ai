@@ -37,11 +37,57 @@ from app.monitoring import list_monitored_ids
 CHAT_KEY = "bot:chat:{}"
 CHAT_TTL = 7 * 24 * 3600
 
+# Rolling AI-generated summary of older exchanges (compacted once the rolling
+# history is about to overflow). Keeps the bot's long-term thread alive.
+SUMMARY_KEY = "bot:chat_summary:{}"
+SUMMARY_MAX_CHARS = 1400
+
 _history_fallback: dict[str, list[dict]] = {}
+_summary_fallback: dict[str, str] = {}
 
 
 def _cap() -> int:
     return max(int(settings.telegram_chat_context_limit or 8), 1) * 2
+
+
+async def get_summary(chat_id: str) -> str:
+    try:
+        client = get_redis()
+        if client is not None:
+            raw = await client.get(SUMMARY_KEY.format(chat_id))
+            if raw:
+                text = raw.decode() if isinstance(raw, bytes) else raw
+                return (text or "")[:SUMMARY_MAX_CHARS]
+            return ""
+    except Exception:  # noqa: BLE001
+        pass
+    return _summary_fallback.get(str(chat_id), "")[:SUMMARY_MAX_CHARS]
+
+
+async def set_summary(chat_id: str, text: str) -> None:
+    if not text:
+        return
+    cropped = text.strip()[:SUMMARY_MAX_CHARS]
+    try:
+        client = get_redis()
+        if client is not None:
+            await client.set(
+                SUMMARY_KEY.format(chat_id), cropped, ex=CHAT_TTL
+            )
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    _summary_fallback[str(chat_id)] = cropped
+
+
+def build_summary_block(summary: str) -> str:
+    if not summary:
+        return ""
+    return (
+        "RINGKASAN OBROLAN SEBELUMNYA (ini inti thread lama — pakai buat "
+        "nangkap konteks, JANGAN ulang dari nol; kutip fakta yang relevan):\n"
+        f"{summary}"
+    )
 
 
 async def get_history(chat_id: str) -> list[dict]:
@@ -162,8 +208,13 @@ async def build_news_briefing(
     return "\n".join(lines)
 
 
-async def build_situation_block(session: AsyncSession) -> str:
-    """Fresh 'state of the world' section injected before each AI reply."""
+async def build_situation_block(session: AsyncSession, *, query: str | None = None) -> str:
+    """Fresh 'state of the world' section injected before each AI reply.
+
+    ``query`` (the user's current message) switches the memory sub-block from
+    plain newest-first recall to keyword-relevant recall, so the injected
+    facts match what the user is actually asking about.
+    """
     import logging
 
     logger = logging.getLogger("kela.context")
@@ -239,7 +290,18 @@ async def build_situation_block(session: AsyncSession) -> str:
         logger.debug("weather block skipped", exc_info=True)
 
     try:
-        mem_block = build_memory_section(await recall(session))
+        if query:
+            from app.memory import recall_relevant
+
+            mem_rows = await recall_relevant(
+                session, query, limit=max(int(settings.memory_relevant_limit or 6), 1)
+            )
+        else:
+            mem_rows = await recall(session)
+        mem_block = build_memory_section(mem_rows, header=(
+            "MEMORI RELEVAN (kutip aja, jangan ngarang):"
+            if query else None
+        ))
         if mem_block:
             lines.append(mem_block)
     except Exception:  # noqa: BLE001

@@ -10,7 +10,15 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base
-from app.interfaces.context import build_situation_block, clear_history, get_history, push_history
+from app.interfaces.context import (
+    build_memory_section,
+    build_situation_block,
+    clear_history,
+    get_history,
+    get_summary,
+    push_history,
+    set_summary,
+)
 from app.interfaces.telegram import _detect_memory_request
 
 
@@ -23,6 +31,7 @@ def _redis_absent(monkeypatch):
     monkeypatch.setattr(_ctx, "get_redis", lambda: None)
     monkeypatch.setattr("app.cache.get_redis", lambda: None)
     _ctx._history_fallback.clear()
+    _ctx._summary_fallback.clear()
     yield
 
 
@@ -152,3 +161,36 @@ def test_detect_memory_request_name_only():
     assert _detect_memory_request("inget") is None
     assert _detect_memory_request("catat   ") is None
     assert _detect_memory_request("tolong inget sama password") is None  # tidak match prefix
+
+
+# ---------------------------------------------------------------------------
+# Rolling long-term conversation summary (Redis-absent in-memory fallback)
+# ---------------------------------------------------------------------------
+
+async def test_summary_empty_by_default():
+    assert await get_summary("ch") == ""
+
+
+async def test_summary_roundtrip_and_cap(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "ai_chat_summary", True)
+    await set_summary("ch", "user lagi ngerjain config nginx di VPS Bekasi")
+    assert "nginx" in await get_summary("ch")
+    await set_summary("ch", "x" * (1500 + 10))
+    assert len(await get_summary("ch")) <= 1400
+
+
+def test_build_summary_block_content():
+    from app.interfaces.context import build_summary_block
+
+    assert build_summary_block("") == ""
+    block = build_summary_block("user pindah ke Cikarang")
+    assert "RINGKASAN" in block
+    assert "Cikarang" in block
+
+
+def test_build_memory_section_custom_header():
+    rows = [type("M", (), {"content": "user suka matcha", "kind": "preference", "created_at": None})()]
+    section = build_memory_section(rows, header="PREFERENSI USER:")
+    assert section.startswith("PREFERENSI USER:")

@@ -31,7 +31,12 @@ def _to_utc(parsed_time: tuple | None) -> datetime | None:
     if not parsed_time:
         return None
     try:
-        return datetime.fromtimestamp(calendar.timegm(parsed_time), tz=timezone.utc)
+        # Naive-UTC on purpose: the DB stores naive datetimes and the recency
+        # cutoff in repo.py is naive too — mixed aware/naive values crash the
+        # `published_at < cutoff` compare at store time.
+        return datetime.fromtimestamp(
+            calendar.timegm(parsed_time), tz=timezone.utc
+        ).replace(tzinfo=None)
     except (ValueError, TypeError, OverflowError):
         return None
 
@@ -49,7 +54,7 @@ def _entry_to_dict(entry: Any, source_id: int) -> dict:
         "description": description,
         "content": None,
         "published_at": _to_utc(entry.get("published_parsed") or entry.get("updated_parsed")),
-        "scraped_at": datetime.now(timezone.utc),
+        "scraped_at": datetime.now(timezone.utc).replace(tzinfo=None),
         "content_hash": article_content_hash(title, description, content=None),
         "language": None,
     }

@@ -67,7 +67,7 @@ HELP = (
     f"  /monitor   {esc('Mulai pantau target + auto-alert DOWN/UP (contoh: /monitor 8.8.8.8)')}\n"
     f"  /monitor stop {esc('<IP|domain> — berhenti pantau')}\n"
     f"  /monitor list {esc('Daftar target yang dipantau')}\n"
-    f"  /memory    {esc('Catatan memori yang gua simpan')}\n"
+    f"  /memory    {esc('Catatan memori yang gua simpan (cari: /memory cari <kata>)')}\n"
     f"  /forget    {esc('<id> — hapus satu catatan memori')}\n"
     f"  /alerts     {esc('Alert terbaru')}\n"
     f"  /documents  {esc('Daftar dokumen')}\n"
@@ -829,10 +829,20 @@ async def monitoring_list(session: AsyncSession) -> str:
 # Jarvis memory (/memory, /forget)
 # ---------------------------------------------------------------------------
 
-async def _memory(session: AsyncSession, arg: str) -> str:  # noqa: ARG001
-    from app.memory import format_memory_list, recall
+async def _memory(session: AsyncSession, arg: str) -> str:
+    from app.memory import format_memory_list, memory_stats, recall, search_memories
 
-    return format_memory_list(await recall(session, limit=10))
+    q = (arg or "").strip()
+    stats = await memory_stats(session)
+    if q.lower().startswith("cari"):
+        term = q[4:].strip().lstrip(":")
+        if not term:
+            return (
+                f"{bold('Memory cari')} — kasih kata kuncinya dong.\n"
+                f"Contoh: {mono('/memory cari bios')}"
+            )
+        return format_memory_list(await search_memories(session, term, limit=10), stats=stats)
+    return format_memory_list(await recall(session, limit=10), stats=stats)
 
 
 async def _forget(session: AsyncSession, arg: str) -> str:

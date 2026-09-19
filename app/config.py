@@ -163,6 +163,11 @@ class Settings(BaseSettings):
     # Jarvis memory (persistent, golden recorded actions + explicit notes)
     memory_max_items: int = Field(default=200, alias="MEMORY_MAX_ITEMS")
     memory_recall_limit: int = Field(default=10, alias="MEMORY_RECALL_LIMIT")
+    memory_relevant_limit: int = Field(default=6, alias="MEMORY_RELEVANT_LIMIT")
+    memory_pref_limit: int = Field(default=5, alias="MEMORY_PREF_LIMIT")
+    memory_action_ttl_days: int = Field(default=30, alias="MEMORY_ACTION_TTL_DAYS")
+    # Long-running conversation summary (AI-generated, best-effort)
+    ai_chat_summary: bool = Field(default=True, alias="AI_CHAT_SUMMARY")
 
     # On-demand web scraping (free-text, SSRF-guarded)
     web_scrape_max_bytes: int = Field(default=524_288, alias="WEB_SCRAPE_MAX_BYTES")
