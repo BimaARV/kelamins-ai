@@ -399,6 +399,29 @@ def _is_question(text: str) -> bool:
     return bool(_QUESTION_RE.search(text or ""))
 
 
+# Conversational/operational words that signal a chat message rather than a
+# real shell invocation ("ip semua switch" asks about switches, it does NOT
+# mean run the ``ip`` binary). Used only as a gate on the *bare-first-token*
+# arbitrary-shell branch; explicitly voiced commands still run.
+_PROSE_RE = re.compile(
+    r"\b("
+    r"semua|semuanya|yang|itu|ini|itu|situ|nya|aja|dong|deh|dah|dung|ya|yah|"
+    r"tolong|minta|bantu|plis|please|bos|bro|cuy|woi|hey|bang|kak|mas|mbak|"
+    r"gw|gua|gue|aku|saya|lo|lu|kamu|kalian|kami|kita|"
+    r"switch|sw-|router|server|monitor|monitoring|pantau|pantauan|dipantau|"
+    r"network|jaringan|vps|vpn|perangkat|device|berarti|gitu|gini|"
+    r"dan|atau|kalau|kalo|biar|supaya|buat|untuk|dari|ke|pada|sama|di|"
+    r"harus|bisa|mau|sedang|lagi|habis|udah|sudah|belum|nggak|gak|ngga|"
+    r"dll|dst|etc|dst|apa|kapan|kenapa|gimana|berapa|yang"
+    r")\b",
+    re.I,
+)
+
+
+def _has_prose(text: str) -> bool:
+    return bool(_PROSE_RE.search(text or ""))
+
+
 def _strip_filler(text: str) -> str:
     t = (text or "").strip().strip(" .,!?;:")
     t = re.sub(r"\s+(dong|deh|donk|dung|ya|yah|plis|please|mas|mbak|kak|bang|bro|cuy|woi|hey)\s*$", "", t, flags=re.I)
@@ -414,6 +437,11 @@ def _looks_like_shell(text: str) -> bool:
     first = toks[0]
     if first in _CMD_NAMES:
         return first not in _RISKY_NAMES or len(toks) <= 1
+    # Bare first-token "raw shell" only fires for a command-looking line.
+    # Casual chat that happens to start with a host binary ("ip semua switch",
+    # "ping semua switch yang dipantau") must NOT be executed as a shell.
+    if _has_prose(text):
+        return False
     return host_command_exists(first)
 
 

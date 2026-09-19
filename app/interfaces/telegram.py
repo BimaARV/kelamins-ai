@@ -273,6 +273,18 @@ async def _reply_ai(text: str, chat_id: str, message_id: int) -> None:
             await send_message(chat_id, diag_out, reply_to=message_id)
             return
 
+    # Inventory ask ("daftar ip semua switch/monitoring") -> real /monitor list.
+    from app.monitoring import detect_monitor_list_request
+
+    if detect_monitor_list_request(text):
+        from app.db.session import session_factory
+        from app.interfaces.commands import monitoring_list as _monitoring_list
+
+        async with session_factory() as session:
+            reply = await _monitoring_list(session)
+        await send_message(chat_id, reply, reply_to=message_id)
+        return
+
     from app.hostcmd import (
         detect_hostcmd_request,
         host_delete_path,

@@ -125,6 +125,11 @@ def detect_mention_diag(text: str, monitors: dict[str, str]) -> dict | None:
     Example: "Tolong trace ke BIOS dong" — "ro-bios" is a monitored target ->
     runs a real traceroute to 103.153.42.237 instead of letting the AI invent
     hops. ``monitors`` maps ``lower_target_name -> target``.
+
+    The intent word itself is masked out before fragment matching, so a monitor
+    whose name *contains the tool word* ("Google Ping") can't swallow a request
+    meant for another target ("ping ke switch cyber" must resolve to the switch,
+    not to 8.8.8.8).
     """
     t = (text or "").strip().strip(" .,!?;:")
     if not t or t.startswith("/") or len(t) > 160:
@@ -139,6 +144,16 @@ def detect_mention_diag(text: str, monitors: dict[str, str]) -> dict | None:
     if matched in ("rute", "route") and _CONFIG_RE.search(t):
         return None
     low = t.lower()
+    # Neutralize the intent word so it cannot be the thing that matches against
+    # a monitor's name fragment (e.g. "ping" in the monitor "google ping").
+    intent_raw = (m.group(1) or "").strip()
+    masked = re.sub(
+        rf"(?<![a-z0-9-]){re.escape(intent_raw.lower())}(?![a-z0-9-])",
+        " ",
+        low,
+        count=1,
+    )
+    kind_word = matched
     for name, target in (monitors or {}).items():
         key = (name or "").strip().lower()
         if len(key) < 3:
@@ -148,7 +163,7 @@ def detect_mention_diag(text: str, monitors: dict[str, str]) -> dict | None:
         if len(parts) > 1 and parts[-1]:
             frags.add(parts[-1])
         if any(
-            len(frag) >= 3 and re.search(rf"\b{re.escape(frag)}\b", low)
+            len(frag) >= 3 and frag != kind_word and re.search(rf"\b{re.escape(frag)}\b", masked)
             for frag in frags
         ) and _target_valid(kind, target):
             return {"kind": kind, "target": target}

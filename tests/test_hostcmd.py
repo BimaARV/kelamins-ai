@@ -196,6 +196,24 @@ def test_detect_raw_shell_first_token(monkeypatch):
     }
 
 
+def test_detect_raw_shell_prose_not_hijacked(monkeypatch):
+    """Chat that merely *starts with* a host binary ('ip semua switch') must
+    never be executed as an arbitrary shell command on the host."""
+    import app.hostcmd as hc
+    monkeypatch.setattr(hc, "host_command_exists", lambda name: True)
+    assert detect_hostcmd_request("ip semua switch dong") is None
+    assert detect_hostcmd_request("ip semua switch") is None
+    assert detect_hostcmd_request("ping semua switch yang dipantau") is None
+    assert detect_hostcmd_request("pingin switch yang lagi up") is None
+    # command-looking lines (no prose filler) still run raw
+    assert detect_hostcmd_request("ls -la /home") == {
+        "kind": "shell", "path": "", "content": "ls -la /home",
+    }
+    assert detect_hostcmd_request("git status") == {
+        "kind": "shell", "path": "", "content": "git status",
+    }
+
+
 def test_detect_voice_shell(monkeypatch):
     import app.hostcmd as hc
     monkeypatch.setattr(hc, "host_command_exists", lambda name: name == "myprog")

@@ -69,6 +69,25 @@ _MONITOR_CANCEL = re.compile(
     re.IGNORECASE,
 )
 
+_MONITOR_LIST_RE = re.compile(
+    r"\b(?:list|daftar|lihat|liat|cek|cekin|tunjukin|kasih|tampilin|tampilkan|info)\s+"
+    r"(?:ip|alamat)\s+(?:semua\s+)?"
+    r"(?:switch\w*|monitor\w*|pantau\w*|network\w*|device\w*|perangkat\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_monitor_list_request(text: str) -> bool:
+    """True for inventory requests like 'daftar ip semua switch/monitoring'.
+
+    Routed to ``/monitor list`` so the IP list is real (from the DB) rather
+    than something the AI invents.
+    """
+    t = (text or "").strip()
+    if not t or t.startswith("/"):
+        return False
+    return bool(_MONITOR_LIST_RE.search(t))
+
 _MEM_FALLBACK: dict[str, set[int] | dict[int, str]] = {
     "ids": set(),
     "status": {},

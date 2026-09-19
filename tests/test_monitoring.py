@@ -18,6 +18,7 @@ from app.interfaces.commands import _monitor, monitoring_list
 from app.monitoring import (
     clear_monitor_name_pending,
     detect_monitor_edit,
+    detect_monitor_list_request,
     detect_monitor_start,
     detect_monitor_stop,
     get_monitor_name_pending,
@@ -85,6 +86,16 @@ def test_detect_monitor_start_domain():
 def test_detect_monitor_start_plain_cek_no_intent():
     assert detect_monitor_start("tolong cek 8.8.8.8") is None
     assert detect_monitor_start("gua mau cek server nih") is None
+
+
+def test_detect_monitor_list_request():
+    assert detect_monitor_list_request("daftar ip semua switch") is True
+    assert detect_monitor_list_request("list ip semua monitoring") is True
+    assert detect_monitor_list_request("cek ip semua device yang dipantau") is True
+    assert detect_monitor_list_request("tunjukin ip semua network") is True
+    assert detect_monitor_list_request("ip semua switch") is False  # no list verb
+    assert detect_monitor_list_request("/monitor list") is False
+    assert detect_monitor_list_request("ping ke switch cyber") is False
 
 
 def test_detect_monitor_start_down_keyword():

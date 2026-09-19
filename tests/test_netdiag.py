@@ -17,6 +17,17 @@ _MONITORS = {
     "ro-univ": "103.153.42.130",
 }
 
+# Mirrors the live DB setup where a monitor's *name* contains the tool word
+# "ping" ("Google Ping" = 8.8.8.8) — that name must NOT swallow requests meant
+# for other, later monitors.
+_MONITORS_FULL = {
+    "google ping": "8.8.8.8",
+    "cloudflare dns": "1.1.1.1",
+    "sw-pop cyber": "192.168.248.2",
+    "sw-pop datahall": "192.168.248.1",
+    **_MONITORS,
+}
+
 
 # ---------------------------------------------------------------------------
 # Intent detection
@@ -105,6 +116,25 @@ def test_detect_mention_diag():
     assert detect_mention_diag("trace ke apapun", _MONITORS) is None  # no known monitor
     assert detect_mention_diag("buatin route ro-bios", _MONITORS) is None  # config-talk
     assert detect_mention_diag("/trace", _MONITORS) is None
+
+
+def test_mention_diag_intent_word_not_swallowed_by_monitor_name():
+    # "ping ke switch cyber" must reach SW-POP CYBER, NOT "Google Ping" (8.8.8.8)
+    # — the tool word inside a monitor name must not match itself.
+    assert detect_mention_diag("tolong ping ke switch cyber", _MONITORS_FULL) == {
+        "kind": "ping", "target": "192.168.248.2"
+    }
+    assert detect_mention_diag("ping switch cyber", _MONITORS_FULL)["target"] == "192.168.248.2"
+    assert detect_mention_diag("tolong ping ke datahall", _MONITORS_FULL)["target"] == "192.168.248.1"
+    assert detect_mention_diag("trace ke switch cyber", _MONITORS_FULL)["target"] == "192.168.248.2"
+
+
+def test_mention_diag_toolword_named_monitor_still_usable():
+    # The "Google Ping" monitor itself is still addressable by its full name.
+    assert detect_mention_diag("ping ke google ping", _MONITORS_FULL) == {
+        "kind": "ping", "target": "8.8.8.8"
+    }
+    assert detect_mention_diag("tolong ping ke cloudflare dns", _MONITORS_FULL)["target"] == "1.1.1.1"
 
 
 # ---------------------------------------------------------------------------
