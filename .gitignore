@@ -14,6 +14,9 @@ htmlcov/
 .env.local
 *.secret
 
+# Project notes / agent instructions
+AGENTS.md
+
 # Storage artifacts
 /storage/documents/*
 /storage/reports/*
