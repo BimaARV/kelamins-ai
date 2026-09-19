@@ -19,7 +19,7 @@ from app.interfaces.context import (
     push_history,
     set_summary,
 )
-from app.interfaces.telegram import _detect_memory_request
+from app.interfaces.telegram import _detect_memory_request, _maybe_summarize
 
 
 @pytest.fixture(autouse=True)
@@ -194,3 +194,88 @@ def test_build_memory_section_custom_header():
     rows = [type("M", (), {"content": "user suka matcha", "kind": "preference", "created_at": None})()]
     section = build_memory_section(rows, header="PREFERENSI USER:")
     assert section.startswith("PREFERENSI USER:")
+
+
+# ---------------------------------------------------------------------------
+# Background chat-summary trigger (_maybe_summarize) — must never leak errors
+# ---------------------------------------------------------------------------
+
+class _FakeFunc:
+    def __init__(self, result):
+        self.result = result
+
+    async def __call__(self, *args, **kwargs):
+        return self.result
+
+
+def _rows(n: int) -> list[dict]:
+    return [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg-{i}"}
+        for i in range(n)
+    ]
+
+
+async def test_maybe_summarize_stores_summary_and_clears_guard(monkeypatch):
+    from app.config import settings
+    from app.interfaces import telegram as _tel
+
+    monkeypatch.setattr(settings, "ai_chat_summary", True)
+    monkeypatch.setattr(settings, "telegram_chat_context_limit", 4)  # cap 8, trigger >=6
+
+    monkeypatch.setattr("app.interfaces.context.get_history", _FakeFunc(_rows(8)))
+    captured: dict[str, str] = {}
+
+    async def _set(chat_id, text):
+        captured["text"] = text
+
+    monkeypatch.setattr("app.interfaces.context.set_summary", _set)
+
+    class FakeGW:
+        configured = True
+
+        async def complete(self, messages, **kwargs):
+            return type("R", (), {"content": "ringkasan: user suka kopi"})()
+
+    monkeypatch.setattr("app.kela_ai.gateway.build_gateway", lambda s: FakeGW())
+
+    await _maybe_summarize("ch")
+    assert "kopi" in captured.get("text", "")
+    assert "ch" not in _tel._summarizing
+
+
+async def test_maybe_summarize_swallows_gateway_error(monkeypatch):
+    from app.config import settings
+    from app.interfaces import telegram as _tel
+
+    monkeypatch.setattr(settings, "ai_chat_summary", True)
+    monkeypatch.setattr(settings, "telegram_chat_context_limit", 4)
+    monkeypatch.setattr("app.interfaces.context.get_history", _FakeFunc(_rows(8)))
+
+    class BoomGW:
+        configured = True
+
+        async def complete(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr("app.kela_ai.gateway.build_gateway", lambda s: BoomGW())
+
+    await _maybe_summarize("ch")  # must not raise
+    assert "ch" not in _tel._summarizing
+
+
+async def test_maybe_summarize_skips_below_threshold(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "ai_chat_summary", True)
+    monkeypatch.setattr(settings, "telegram_chat_context_limit", 4)
+    monkeypatch.setattr("app.interfaces.context.get_history", _FakeFunc(_rows(4)))
+
+    called = {"n": 0}
+
+    async def _set(chat_id, text):
+        called["n"] += 1
+
+    monkeypatch.setattr("app.interfaces.context.set_summary", _set)
+
+    await _maybe_summarize("ch")
+    assert called["n"] == 0

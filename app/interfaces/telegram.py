@@ -1023,18 +1023,18 @@ async def _maybe_summarize(chat_id: str) -> None:
         return
     if chat_id in _summarizing:
         return
-    cap = max(int(settings.telegram_chat_context_limit or 8), 1) * 2
-    rows = await get_history(chat_id)
-    if len(rows) < cap - _SUMMARY_TRIGGER_GAP:
-        return
-    from app.interfaces.context import set_summary
+    from app.interfaces.context import get_history, set_summary
     from app.kela_ai.gateway import build_gateway
 
-    gw = build_gateway(settings)
-    if not gw.configured:
-        return
-    _summarizing.add(chat_id)
     try:
+        cap = max(int(settings.telegram_chat_context_limit or 8), 1) * 2
+        rows = await get_history(chat_id)
+        if len(rows) < cap - _SUMMARY_TRIGGER_GAP:
+            return
+        gw = build_gateway(settings)
+        if not gw.configured:
+            return
+        _summarizing.add(chat_id)
         transcript = "\n".join(
             f"{r['role']}: {r['content'][:400]}" for r in rows
         )
