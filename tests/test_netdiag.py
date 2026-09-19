@@ -25,6 +25,10 @@ _MONITORS_FULL = {
     "cloudflare dns": "1.1.1.1",
     "sw-pop cyber": "192.168.248.2",
     "sw-pop datahall": "192.168.248.1",
+    # Shared last-token "univ": router (ro-univ) vs switch (sw-main univ).
+    # A "switch main univ" ask must reach the SWITCH, not the router.
+    "ro-univ": "103.153.42.130",
+    "sw-main univ": "172.16.88.254",
     **_MONITORS,
 }
 
@@ -135,6 +139,21 @@ def test_mention_diag_toolword_named_monitor_still_usable():
         "kind": "ping", "target": "8.8.8.8"
     }
     assert detect_mention_diag("tolong ping ke cloudflare dns", _MONITORS_FULL)["target"] == "1.1.1.1"
+
+
+def test_mention_diag_scoring_prefers_qualifier_over_shared_token():
+    # "univ" is the last token of BOTH ro-univ and sw-main univ; the "switch"
+    # qualifier must select the switch, not the router that comes first.
+    assert detect_mention_diag("ping ke switch main univ", _MONITORS_FULL) == {
+        "kind": "ping", "target": "172.16.88.254"
+    }
+    # Router ask still resolves to the router monitor.
+    assert detect_mention_diag("ping ke router univ", _MONITORS_FULL) == {
+        "kind": "ping", "target": "103.153.42.130"
+    }
+    assert detect_mention_diag("trace ke main univ", _MONITORS_FULL)["target"] == "172.16.88.254"
+    # Ambiguous bare "univ" (no switch/router qualifier) -> first monitor wins.
+    assert detect_mention_diag("ping ke univ", _MONITORS_FULL)["target"] == "103.153.42.130"
 
 
 # ---------------------------------------------------------------------------

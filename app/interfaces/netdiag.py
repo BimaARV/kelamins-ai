@@ -82,6 +82,31 @@ def _target_valid(kind: str, target: str) -> bool:
     return parse_server_request(f"{kind} {target}") is not None
 
 
+# Stopwords + synonyms for comparing user text with monitor NAMES, so
+# "ping ke switch main univ" is scored against the *whole* name instead of
+# whichever monitor happens to share the last token ("univ" exists on both
+# "ro-univ" and "sw-main univ").
+_DIAG_STOPWORDS = {
+    "ke", "di", "yang", "itu", "ini", "itu", "sini", "situ", "aja", "dong",
+    "deh", "dah", "tolong", "minta", "coba", "cobain", "bro", "bang", "mas",
+    "kak", "gua", "gue", "gw", "aku", "saya", "lo", "lu", "kamu", "gan",
+    "dll", "bisa", "mau", "sama", "pada", "dari", "untuk", "buat", "lagi",
+}
+_DIAG_SYNONYMS = {
+    "switch": "sw", "switches": "sw", "router": "ro", "routers": "ro",
+}
+
+
+def _name_tokens(text: str) -> set[str]:
+    words = set()
+    for part in re.split(r"[^a-z0-9]+", (text or "").lower()):
+        part = part.strip("_ -")
+        if not part or part in _DIAG_STOPWORDS:
+            continue
+        words.add(_DIAG_SYNONYMS.get(part, part))
+    return words
+
+
 def detect_diag_request(text: str) -> dict | None:
     """Return ``{kind, target}`` for a network-diagnostic request, else None.
 
@@ -153,20 +178,26 @@ def detect_mention_diag(text: str, monitors: dict[str, str]) -> dict | None:
         low,
         count=1,
     )
-    kind_word = matched
+
+    user_words = _name_tokens(masked)
+    masked_norm = re.sub(r"[^a-z0-9]", "", masked)
+    best: dict | None = None
+    best_score = 0
     for name, target in (monitors or {}).items():
         key = (name or "").strip().lower()
         if len(key) < 3:
             continue
-        frags = {key, key.replace("-", "").replace("_", "").replace(" ", "")}
-        parts = re.split(r"[-\s_]+", key)
-        if len(parts) > 1 and parts[-1]:
-            frags.add(parts[-1])
-        if any(
-            len(frag) >= 3 and frag != kind_word and re.search(rf"\b{re.escape(frag)}\b", masked)
-            for frag in frags
-        ) and _target_valid(kind, target):
-            return {"kind": kind, "target": target}
+        score = len(user_words & _name_tokens(key))
+        # Explicit full-name mention ("ping ke google ping") outweighs any
+        # partial token overlap on other monitors.
+        raw_norm = re.sub(r"[^a-z0-9]", "", key)
+        if raw_norm in masked_norm:
+            score += 50
+        if score > best_score:
+            best_score = score
+            best = {"kind": kind, "target": target}
+    if best is not None and _target_valid(kind, best["target"]):
+        return best
     return None
 
 
